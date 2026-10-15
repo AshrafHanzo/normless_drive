@@ -10,6 +10,7 @@ mod config;
 mod crypto;
 mod db;
 mod error;
+mod keycache;
 
 use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer};
 use config::Config;
@@ -42,11 +43,28 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_config = web::Data::new(config);
     let shared_pool = web::Data::new(pool);
+    let shared_keys = web::Data::new(keycache::KeyCache::new());
+
+    // Idle keys would otherwise sit in memory until their cookie expired,
+    // two weeks later. Hourly is far more often than needed and costs
+    // nothing — the map holds one entry per signed-in session.
+    let sweeper = shared_keys.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            let dropped = sweeper.sweep();
+            if dropped > 0 {
+                tracing::debug!(dropped, remaining = sweeper.len(), "swept idle keys");
+            }
+        }
+    });
 
     HttpServer::new(move || {
         App::new()
             .app_data(shared_pool.clone())
             .app_data(shared_config.clone())
+            .app_data(shared_keys.clone())
             // Reject oversized JSON bodies early. File uploads do not come
             // through this extractor -- they stream -- so a small cap here
             // costs nothing and stops a trivial memory-exhaustion attempt.

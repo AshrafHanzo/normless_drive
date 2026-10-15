@@ -14,8 +14,10 @@ use super::{
 };
 use crate::{
     config::Config,
+    crypto,
     db::Db,
     error::{ApiError, ApiResult},
+    keycache::KeyCache,
 };
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -71,15 +73,21 @@ async fn register(
         (Role::User, Status::Pending)
     };
 
+    // The salt for the wrapping key is fixed at registration and never
+    // changes for the life of the account, except when the password changes
+    // and everything under it is rewritten together.
+    let kdf_salt = crypto::generate_salt();
+
     let row: Result<(Uuid,), sqlx::Error> = sqlx::query_as(
-        "INSERT INTO users (email, password_hash, role, status)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO users (email, password_hash, role, status, kdf_salt)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING id",
     )
     .bind(&email)
     .bind(&password_hash)
     .bind(role.as_str())
     .bind(status.as_str())
+    .bind(kdf_salt.as_slice())
     .fetch_one(pool.get_ref())
     .await;
 
@@ -116,11 +124,13 @@ async fn login(
     body: web::Json<Credentials>,
     pool: web::Data<Db>,
     config: web::Data<Config>,
+    keys: web::Data<KeyCache>,
 ) -> ApiResult<HttpResponse> {
     let email = normalize_email(&body.email).map_err(ApiError::BadRequest)?;
 
-    let found: Option<(Uuid, String, String, String)> = sqlx::query_as(
-        "SELECT id, password_hash, role, status FROM users WHERE lower(email) = lower($1)",
+    let found: Option<(Uuid, String, String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, password_hash, role, status, kdf_salt
+           FROM users WHERE lower(email) = lower($1)",
     )
     .bind(&email)
     .fetch_optional(pool.get_ref())
@@ -130,7 +140,7 @@ async fn login(
     // endpoint cannot be used to enumerate who has an account here.
     let invalid = || ApiError::Forbidden("Incorrect email or password.".into());
 
-    let (id, password_hash, role, status) = found.ok_or_else(invalid)?;
+    let (id, password_hash, role, status, kdf_salt) = found.ok_or_else(invalid)?;
 
     let password_ok = verify_password(&body.password, &password_hash)
         .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
@@ -173,6 +183,16 @@ async fn login(
         .execute(pool.get_ref())
         .await?;
 
+    // This is the only point in the lifetime of a session where the
+    // plaintext password exists on the server. Derive the wrapping key now
+    // or the user's Telegram session stays unreadable for the whole session.
+    match crypto::derive_key(&body.password, &kdf_salt) {
+        Ok(key) => keys.insert(token.hash.clone(), key),
+        // Not fatal: signing in still works, the drive simply cannot
+        // decrypt until they sign in again. Better than refusing the login.
+        Err(error) => tracing::error!(?error, user = %id, "could not derive the wrapping key"),
+    }
+
     audit(pool.get_ref(), Some(id), Some(id), "user.login", None).await;
 
     Ok(HttpResponse::Ok()
@@ -189,9 +209,14 @@ async fn logout(
     request: HttpRequest,
     pool: web::Data<Db>,
     config: web::Data<Config>,
+    keys: web::Data<KeyCache>,
 ) -> ApiResult<HttpResponse> {
     if let Some(cookie) = request.cookie(SESSION_COOKIE) {
         let hash = hash_session_token(cookie.value());
+        // Drop the key first. If the delete below fails, the worse outcome
+        // is a live row whose key is gone — recoverable by signing in again
+        // — rather than a dead row whose key lingers in memory.
+        keys.remove(&hash);
         sqlx::query("DELETE FROM app_sessions WHERE token_hash = $1")
             .bind(&hash)
             .execute(pool.get_ref())
@@ -223,13 +248,15 @@ async fn change_password(
     user: CurrentUser,
     body: web::Json<PasswordChange>,
     pool: web::Data<Db>,
+    keys: web::Data<KeyCache>,
 ) -> ApiResult<HttpResponse> {
     validate_password(&body.new_password).map_err(ApiError::BadRequest)?;
 
-    let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
-        .bind(user.id)
-        .fetch_one(pool.get_ref())
-        .await?;
+    let (stored, kdf_salt): (String, Vec<u8>) =
+        sqlx::query_as("SELECT password_hash, kdf_salt FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(pool.get_ref())
+            .await?;
 
     let ok = verify_password(&body.current_password, &stored)
         .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
@@ -245,55 +272,54 @@ async fn change_password(
     // transaction that either fully applies or does not happen at all.
     let mut tx = pool.begin().await?;
 
-    let session_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT session_enc, session_nonce, api_hash_enc, api_hash_nonce, kdf_salt
+    let old_key = crypto::derive_key(&body.current_password, &kdf_salt)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+    // A fresh salt as well as a fresh key: nothing encrypted under the old
+    // one survives this transaction, so there is no reason to keep it.
+    let new_salt = crypto::generate_salt();
+    let new_key = crypto::derive_key(&body.new_password, &new_salt)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+
+    let session_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT session_enc, session_nonce, api_hash_enc, api_hash_nonce
          FROM tg_sessions WHERE user_id = $1 FOR UPDATE",
     )
     .bind(user.id)
     .fetch_optional(&mut *tx)
     .await?;
 
-    if let Some((session_enc, session_nonce, api_hash_enc, api_hash_nonce, salt)) = session_row {
-        let old_key = crate::crypto::derive_key(&body.current_password, &salt)
-            .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
-
+    if let Some((session_enc, session_nonce, api_hash_enc, api_hash_nonce)) = session_row {
         // A failure here means the stored session was already unreadable,
         // which is a fault worth surfacing rather than papering over by
         // dropping the row.
-        let session = crate::crypto::decrypt(&old_key, &session_enc, &session_nonce)
+        let session = crypto::decrypt(&old_key, &session_enc, &session_nonce)
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("stored session did not decrypt")))?;
-        let api_hash = crate::crypto::decrypt(&old_key, &api_hash_enc, &api_hash_nonce)
+        let api_hash = crypto::decrypt(&old_key, &api_hash_enc, &api_hash_nonce)
             .map_err(|_| ApiError::Internal(anyhow::anyhow!("stored api hash did not decrypt")))?;
 
-        // A fresh salt as well as a fresh key: no reason to keep the old one
-        // around once everything under it is being rewritten.
-        let new_salt = crate::crypto::generate_salt();
-        let new_key = crate::crypto::derive_key(&body.new_password, &new_salt)
+        let (session_enc, session_nonce) = crypto::encrypt(&new_key, &session)
             .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
-
-        let (session_enc, session_nonce) = crate::crypto::encrypt(&new_key, &session)
-            .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
-        let (api_hash_enc, api_hash_nonce) = crate::crypto::encrypt(&new_key, &api_hash)
+        let (api_hash_enc, api_hash_nonce) = crypto::encrypt(&new_key, &api_hash)
             .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
 
         sqlx::query(
             "UPDATE tg_sessions
              SET session_enc = $1, session_nonce = $2,
-                 api_hash_enc = $3, api_hash_nonce = $4, kdf_salt = $5
-             WHERE user_id = $6",
+                 api_hash_enc = $3, api_hash_nonce = $4
+             WHERE user_id = $5",
         )
         .bind(&session_enc)
         .bind(&session_nonce)
         .bind(&api_hash_enc)
         .bind(&api_hash_nonce)
-        .bind(new_salt.as_slice())
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
     }
 
-    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+    sqlx::query("UPDATE users SET password_hash = $1, kdf_salt = $2 WHERE id = $3")
         .bind(&new_hash)
+        .bind(new_salt.as_slice())
         .bind(user.id)
         .execute(&mut *tx)
         .await?;
@@ -301,12 +327,18 @@ async fn change_password(
     // Every other login is invalidated: a password change is how someone
     // responds to a session they think is stolen, so leaving the rest alive
     // would defeat the point.
-    sqlx::query("DELETE FROM app_sessions WHERE user_id = $1")
-        .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
+    let revoked: Vec<(Vec<u8>,)> =
+        sqlx::query_as("DELETE FROM app_sessions WHERE user_id = $1 RETURNING token_hash")
+            .bind(user.id)
+            .fetch_all(&mut *tx)
+            .await?;
 
     tx.commit().await?;
+
+    // Only after the commit: dropping cached keys for sessions that still
+    // exist, because the transaction rolled back, would log the user out of
+    // their drive for no reason.
+    keys.remove_many(&revoked.into_iter().map(|(hash,)| hash).collect::<Vec<_>>());
 
     audit(pool.get_ref(), Some(user.id), Some(user.id), "user.password_changed", None).await;
 
