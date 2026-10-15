@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+﻿import { useCallback, useEffect, useState } from "react";
 import { HardDrive, LogOut, Shield } from "lucide-react";
 import { api, ApiError, type User } from "./api";
 import { Admin } from "./pages/Admin";
+import { ConnectTelegram } from "./pages/ConnectTelegram";
 import { SignIn } from "./pages/SignIn";
 import { Button, Card, Spinner } from "./ui";
 
@@ -13,7 +14,7 @@ export default function App() {
   const [view, setView] = useState<View>("drive");
 
   // Ask the server who we are on load. The session is an HttpOnly cookie, so
-  // this is the only way to know — there is nothing readable in JS to check.
+  // this is the only way to know â€” there is nothing readable in JS to check.
   useEffect(() => {
     let cancelled = false;
     api
@@ -81,30 +82,50 @@ export default function App() {
       {view === "admin" && user.role === "admin" ? (
         <Admin me={user} />
       ) : (
-        <Placeholder />
+        <Drive />
       )}
     </div>
   );
 }
 
-/// The file browser is not built yet. Saying so plainly beats an empty page
-/// that looks broken.
-function Placeholder() {
+/// Shows the connect wizard until Telegram is linked, then the drive.
+function Drive() {
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    api.telegram
+      .status()
+      .then((status) => {
+        setConnected(status.connected);
+        setHint(status.phone_hint);
+      })
+      .catch(() => setConnected(false));
+  }, []);
+
+  useEffect(refresh, [refresh]);
+
+  if (connected === null) return <Spinner />;
+  if (!connected) return <ConnectTelegram onConnected={refresh} />;
+
   return (
     <div className="mx-auto max-w-5xl px-4 py-12">
       <Card className="px-6 py-12 text-center">
-        <h2 className="text-base font-semibold text-ink">
-          Connect your Telegram account
-        </h2>
+        <h2 className="text-base font-semibold text-ink">Telegram connected</h2>
         <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-ink-muted">
-          Your files are stored in your own Telegram account. Once the
-          connection flow is built, this is where you will link it and browse
-          your drive.
+          Linked to the account ending {hint ?? "â€”"}. Browsing and uploading
+          files is the next piece of work.
         </p>
-        <p className="mx-auto mt-4 max-w-md text-xs text-ink-faint">
-          Not built yet — accounts and administration are working, file
-          handling is next.
-        </p>
+        <Button
+          variant="ghost"
+          className="mx-auto mt-5"
+          onClick={async () => {
+            await api.telegram.disconnect().catch(() => undefined);
+            refresh();
+          }}
+        >
+          Disconnect Telegram
+        </Button>
       </Card>
     </div>
   );

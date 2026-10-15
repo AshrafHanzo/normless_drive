@@ -1,4 +1,4 @@
-//! The connect wizard, server side.
+﻿//! The connect wizard, server side.
 //!
 //!   POST /api/telegram/start     api_id, api_hash, phone  -> code sent
 //!   POST /api/telegram/code      code                     -> done | needs password
@@ -10,8 +10,8 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    client_from_session, request_code, submit_code, submit_password, CodeOutcome, LoginStage,
-    Pending, SharedPending, TelegramError,
+    request_code, submit_code, submit_password, CodeOutcome, LoginStage, Pending, SharedPending,
+    TelegramError,
 };
 use crate::{
     auth::{hash_session_token, routes::audit, CurrentUser, SESSION_COOKIE},
@@ -50,7 +50,7 @@ impl From<TelegramError> for ApiError {
 ///
 /// Absent means the server restarted, or the session went idle, since they
 /// signed in. Nothing encrypted can be read or written until they sign in
-/// again — and saying so plainly beats a decryption error.
+/// again â€” and saying so plainly beats a decryption error.
 fn wrapping_key(
     request: &HttpRequest,
     keys: &KeyCache,
@@ -147,13 +147,13 @@ async fn start(
     // Replaces any earlier attempt, closing its connection.
     pending.remove(user.id).await;
 
-    let (client, token) = request_code(body.api_id, &api_hash, &phone).await?;
+    let (connection, token) = request_code(body.api_id, &api_hash, &phone).await?;
 
     pending
         .insert(
             user.id,
             Pending {
-                client,
+                connection,
                 stage: LoginStage::AwaitingCode(token),
                 api_id: body.api_id,
                 api_hash,
@@ -205,9 +205,11 @@ async fn code(
         return Err(ApiError::BadRequest("Enter the code Telegram sent you.".into()));
     }
 
-    match submit_code(&entry.client, token, &typed).await {
+    let outcome = submit_code(&entry.connection, token, &typed).await;
+
+    match outcome {
         Ok(CodeOutcome::SignedIn(session)) => {
-            store_session(
+            let result = store_session(
                 &request,
                 &user,
                 entry.api_id,
@@ -217,15 +219,22 @@ async fn code(
                 &pool,
                 &keys,
             )
-            .await?;
+            .await;
+
+            // Done with Telegram either way: the session is saved, so this
+            // connection has no further use and must not be left holding a
+            // socket and a spawned task.
+            entry.connection.close().await;
+            result?;
+
             Ok(HttpResponse::Ok().json(StepResponse {
                 connected: true,
                 needs_password: false,
             }))
         }
         Ok(CodeOutcome::NeedsPassword(password_token)) => {
-            // Keep the client alive: the password step must run on the same
-            // connection that accepted the code.
+            // Keep the connection alive: the password step must run on the
+            // same one that accepted the code.
             pending
                 .insert(
                     user.id,
@@ -241,10 +250,13 @@ async fn code(
             }))
         }
         Err(error) => {
-            // A wrong code is worth another go on the same token; an expired
-            // one is not, and putting it back would loop the user forever.
+            // A mistyped code is worth another go on the same token. Any
+            // other failure ends the attempt, and putting it back would
+            // loop the user forever — so close it.
             if matches!(error, TelegramError::BadCode) {
                 pending.insert(user.id, entry).await;
+            } else {
+                entry.connection.close().await;
             }
             Err(error.into())
         }
@@ -271,9 +283,9 @@ async fn password(
     // Destructured rather than rebuilt: `check_password` consumes the token
     // and nothing afterwards needs a stage, so there is no dummy value to
     // invent. A wrong password therefore ends this attempt and the user
-    // restarts from the phone number — Telegram's own clients do the same.
+    // restarts from the phone number â€” Telegram's own clients do the same.
     let Pending {
-        client,
+        connection,
         stage,
         api_id,
         api_hash,
@@ -282,13 +294,27 @@ async fn password(
     } = entry;
 
     let LoginStage::AwaitingPassword(token) = stage else {
+        // Wrong step. Close rather than drop, or the pool task outlives the
+        // request that owned it.
+        connection.close().await;
         return Err(ApiError::BadRequest(
             "This attempt is waiting for the code Telegram sent, not a password.".into(),
         ));
     };
 
-    let session = submit_password(&client, token, &body.password).await?;
-    store_session(&request, &user, api_id, &api_hash, &phone, session, &pool, &keys).await?;
+    let signed_in = submit_password(&connection, *token, &body.password).await;
+
+    let stored = match signed_in {
+        Ok(session) => {
+            store_session(&request, &user, api_id, &api_hash, &phone, session, &pool, &keys).await
+        }
+        Err(error) => Err(error.into()),
+    };
+
+    // The token is consumed either way, so this connection is finished
+    // whether the password was right or not.
+    connection.close().await;
+    stored?;
 
     Ok(HttpResponse::Ok().json(StepResponse {
         connected: true,
@@ -370,13 +396,13 @@ async fn store_session(
     Ok(())
 }
 
-/// Keeps only enough of the number to be recognisable: `+91 ••••• ••123`.
-/// Stored rather than the full number — the drive has no use for it and a
+/// Keeps only enough of the number to be recognisable: `+91 â€¢â€¢â€¢â€¢â€¢ â€¢â€¢123`.
+/// Stored rather than the full number â€” the drive has no use for it and a
 /// phone number is personal data worth not keeping.
 fn hint(phone: &str) -> String {
     let digits: Vec<char> = phone.chars().filter(|c| c.is_ascii_digit()).collect();
     let tail: String = digits.iter().rev().take(3).rev().collect();
-    format!("•••••{tail}")
+    format!("â€¢â€¢â€¢â€¢â€¢{tail}")
 }
 
 fn normalize_phone(raw: &str) -> Result<String, String> {
@@ -411,7 +437,7 @@ mod tests {
     fn the_stored_hint_reveals_only_the_last_three_digits() {
         // Enough for the owner to recognise which number they used, not
         // enough to be worth stealing.
-        assert_eq!(hint("+919876543210"), "•••••210");
-        assert_eq!(hint("+1 555 0100"), "•••••100");
+        assert_eq!(hint("+919876543210"), "â€¢â€¢â€¢â€¢â€¢210");
+        assert_eq!(hint("+1 555 0100"), "â€¢â€¢â€¢â€¢â€¢100");
     }
 }

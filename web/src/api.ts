@@ -121,6 +121,40 @@ export const api = {
 
   me: () => request<User>("/api/auth/me"),
 
+  telegram: {
+    status: () =>
+      request<{
+        connected: boolean;
+        phone_hint: string | null;
+        connected_at: string | null;
+        unlocked: boolean;
+      }>("/api/telegram/status"),
+
+    start: (api_id: number, api_hash: string, phone: string) =>
+      request<{ sent: boolean; phone_hint: string }>("/api/telegram/start", {
+        method: "POST",
+        body: json({ api_id, api_hash, phone }),
+      }),
+
+    code: (code: string) =>
+      request<{ connected: boolean; needs_password: boolean }>(
+        "/api/telegram/code",
+        { method: "POST", body: json({ code }) },
+      ),
+
+    password: (password: string) =>
+      request<{ connected: boolean; needs_password: boolean }>(
+        "/api/telegram/password",
+        { method: "POST", body: json({ password }) },
+      ),
+
+    disconnect: () =>
+      request<{ ok: true; was_connected: boolean }>(
+        "/api/telegram/disconnect",
+        { method: "POST" },
+      ),
+  },
+
   admin: {
     users: () => request<{ users: AdminUserRow[] }>("/api/admin/users"),
 

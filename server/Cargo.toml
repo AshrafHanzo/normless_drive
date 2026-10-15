@@ -38,6 +38,9 @@ deadpool-postgres = "0.14"
 grammers-client = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
 grammers-session = { git = "https://github.com/Lonami/grammers", rev = "d07f96f", features = ["serde"] }
 grammers-tl-types = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
+# Needed directly for SenderPool: a grammers Client is built on top of one,
+# and the pool's runner has to be spawned for the connection to stay alive.
+grammers-mtsender = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

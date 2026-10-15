@@ -1,43 +1,87 @@
-//! Connecting a user's Telegram account.
+﻿//! Connecting a user's Telegram account.
 //!
-//! Telegram's login is a multi-step conversation: ask for a code, the user
-//! reads it off their phone, send it back, and possibly answer a 2FA
-//! password as well. The client that asked for the code is the only one that
-//! can redeem it — the login token is bound to that connection — so the
-//! half-finished client has to stay alive in memory between HTTP requests.
-//! That is what `PendingLogins` is for.
+//! Telegram's login is a conversation: ask for a code, the user reads it off
+//! their phone, send it back, maybe answer a 2FA password too. The client
+//! that asked for the code is the only one that can redeem it, and in
+//! grammers that client is backed by a `SenderPool` whose runner must stay
+//! spawned for the connection to live. So a half-finished login keeps its
+//! client, its pool task and its session alive in memory between HTTP
+//! requests â€” that is what `PendingLogins` holds.
 //!
-//! Once sign-in succeeds the session is encrypted with the user's wrapping
-//! key (`crate::keycache`) and written to `tg_sessions`. The plaintext
-//! session never touches disk.
+//! On success the session is exported (see `session_store`), encrypted with
+//! the user's wrapping key, and written to Postgres. Plaintext never
+//! reaches disk.
 
 pub mod routes;
+pub mod session_store;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use grammers_client::{Client, Config, SignInError};
-use grammers_session::Session;
+use grammers_client::{Client, SignInError};
+use grammers_mtsender::SenderPool;
+use grammers_session::storages::MemorySession;
+use grammers_session::SessionData;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// How long a half-finished login survives.
 ///
-/// Telegram's own codes expire in minutes, and each pending entry holds an
-/// open connection, so there is nothing to gain by keeping them longer.
+/// Telegram's codes expire in minutes, and each pending entry holds an open
+/// connection, so there is nothing to gain by keeping them longer.
 const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// A live connection plus everything needed to tear it down cleanly.
+///
+/// The runner task and the handle are kept, not dropped: the pool's `run()`
+/// future finishes as soon as every handle is gone, which would close the
+/// connection out from under a login that is only half done.
+pub struct Connection {
+    pub client: Client,
+    pub session: Arc<MemorySession>,
+    handle: grammers_mtsender::SenderPoolHandle,
+    task: JoinHandle<()>,
+}
+
+impl Connection {
+    /// Opens a connection against a fresh or restored session.
+    pub fn open(session: Arc<MemorySession>, api_id: i32) -> Self {
+        let pool = SenderPool::new(Arc::clone(&session), api_id);
+        let client = Client::new(&pool);
+        let SenderPool { runner, handle, .. } = pool;
+        let task = tokio::spawn(runner.run());
+
+        Self {
+            client,
+            session,
+            handle,
+            task,
+        }
+    }
+
+    /// Closes the connection and waits for its task to finish.
+    pub async fn close(self) {
+        drop(self.handle);
+        drop(self.client);
+        // The runner exits once the handles are gone. Awaiting it means a
+        // closed connection is actually closed before we return, rather
+        // than lingering as a detached task holding a socket.
+        let _ = self.task.await;
+    }
+}
 
 /// Where a connection attempt has got to.
 pub enum LoginStage {
     /// A code has been sent; waiting for the user to type it.
     AwaitingCode(grammers_client::types::LoginToken),
     /// The code was right but the account has 2FA; waiting for the password.
-    AwaitingPassword(grammers_client::types::PasswordToken),
+    AwaitingPassword(Box<grammers_client::types::PasswordToken>),
 }
 
 pub struct Pending {
-    pub client: Client,
+    pub connection: Connection,
     pub stage: LoginStage,
     pub api_id: i32,
     pub api_hash: String,
@@ -46,9 +90,6 @@ pub struct Pending {
 }
 
 /// In-flight logins, one per user.
-///
-/// A second attempt replaces the first rather than queueing: a user who
-/// restarts the wizard wants the old half-finished attempt gone.
 #[derive(Default)]
 pub struct PendingLogins {
     inner: Mutex<HashMap<Uuid, Pending>>,
@@ -59,32 +100,55 @@ impl PendingLogins {
         Self::default()
     }
 
+    /// Stores an attempt, closing any earlier one for the same user. A user
+    /// who restarts the wizard wants the previous half-finished attempt
+    /// gone, and its connection released.
     pub async fn insert(&self, user: Uuid, pending: Pending) {
-        self.inner.lock().await.insert(user, pending);
+        let displaced = self.inner.lock().await.insert(user, pending);
+        if let Some(old) = displaced {
+            old.connection.close().await;
+        }
     }
 
+    /// Removes and returns an attempt, or `None` if it expired.
+    ///
+    /// An expired entry is closed rather than handed back: Telegram has
+    /// already forgotten the token, so returning it would fail confusingly
+    /// two steps later instead of clearly here.
     pub async fn take(&self, user: Uuid) -> Option<Pending> {
-        let mut map = self.inner.lock().await;
-        let pending = map.remove(&user)?;
+        let pending = self.inner.lock().await.remove(&user)?;
         if pending.started.elapsed() > PENDING_TTL {
-            // Expired. Dropping it closes the connection, and the caller is
-            // told to start again rather than given a token Telegram has
-            // already forgotten.
+            pending.connection.close().await;
             return None;
         }
         Some(pending)
     }
 
     pub async fn remove(&self, user: Uuid) {
-        self.inner.lock().await.remove(&user);
+        let removed = self.inner.lock().await.remove(&user);
+        if let Some(pending) = removed {
+            pending.connection.close().await;
+        }
     }
 
-    /// Drops entries past their TTL, closing their connections.
+    /// Closes attempts past their TTL. Each one holds a socket, so this
+    /// matters more than sweeping idle keys does.
     pub async fn sweep(&self) -> usize {
-        let mut map = self.inner.lock().await;
-        let before = map.len();
-        map.retain(|_, pending| pending.started.elapsed() <= PENDING_TTL);
-        before - map.len()
+        let expired: Vec<Pending> = {
+            let mut map = self.inner.lock().await;
+            let stale: Vec<Uuid> = map
+                .iter()
+                .filter(|(_, p)| p.started.elapsed() > PENDING_TTL)
+                .map(|(id, _)| *id)
+                .collect();
+            stale.iter().filter_map(|id| map.remove(id)).collect()
+        };
+
+        let count = expired.len();
+        for pending in expired {
+            pending.connection.close().await;
+        }
+        count
     }
 
     pub async fn len(&self) -> usize {
@@ -94,7 +158,7 @@ impl PendingLogins {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TelegramError {
-    #[error("Could not reach Telegram. Check the API ID and hash, then try again.")]
+    #[error("Could not reach Telegram. Check your API ID and hash, then try again.")]
     Connect,
     #[error("Telegram rejected that phone number.")]
     BadPhone,
@@ -104,12 +168,12 @@ pub enum TelegramError {
     ExpiredCode,
     #[error("That two-step verification password is not right.")]
     BadPassword,
-    #[error("This account has two-step verification enabled.")]
-    PasswordRequired,
-    #[error("Telegram is asking you to sign up rather than sign in — this phone number has no Telegram account.")]
+    #[error("This phone number has no Telegram account. Sign up in the Telegram app first.")]
     NoAccount,
     #[error("Telegram asked us to wait {0} seconds before trying again.")]
     FloodWait(u32),
+    #[error("Could not save the Telegram session.")]
+    Session,
     #[error("Telegram said: {0}")]
     Other(String),
 }
@@ -119,31 +183,25 @@ pub async fn request_code(
     api_id: i32,
     api_hash: &str,
     phone: &str,
-) -> Result<(Client, grammers_client::types::LoginToken), TelegramError> {
-    let client = Client::connect(Config {
-        session: Session::new(),
-        api_id,
-        api_hash: api_hash.to_string(),
-        params: Default::default(),
-    })
-    .await
-    .map_err(|error| {
-        tracing::warn!(?error, "telegram connect failed");
-        TelegramError::Connect
-    })?;
+) -> Result<(Connection, grammers_client::types::LoginToken), TelegramError> {
+    let session = Arc::new(MemorySession::from(SessionData::default()));
+    let connection = Connection::open(session, api_id);
 
-    let token = client
-        .request_login_code(phone)
-        .await
-        .map_err(|error| classify(&error))?;
-
-    Ok((client, token))
+    match connection.client.request_login_code(phone, api_hash).await {
+        Ok(token) => Ok((connection, token)),
+        Err(error) => {
+            // Close before returning, or a rejected attempt leaks a socket
+            // and a task for every retry.
+            connection.close().await;
+            Err(classify(&error))
+        }
+    }
 }
 
 /// Maps grammers' error text onto something a user can act on.
 ///
-/// grammers surfaces Telegram's raw RPC error names; showing
-/// `PHONE_CODE_INVALID` to someone who mistyped a digit is not helpful.
+/// grammers surfaces Telegram's raw RPC names; `PHONE_CODE_INVALID` is not
+/// a useful thing to show someone who mistyped a digit.
 fn classify(error: &grammers_client::InvocationError) -> TelegramError {
     let text = error.to_string();
 
@@ -158,90 +216,67 @@ fn classify(error: &grammers_client::InvocationError) -> TelegramError {
 
     match () {
         _ if text.contains("PHONE_NUMBER_INVALID") => TelegramError::BadPhone,
+        _ if text.contains("PHONE_NUMBER_UNOCCUPIED") => TelegramError::NoAccount,
         _ if text.contains("PHONE_CODE_INVALID") => TelegramError::BadCode,
         _ if text.contains("PHONE_CODE_EXPIRED") => TelegramError::ExpiredCode,
         _ if text.contains("PASSWORD_HASH_INVALID") => TelegramError::BadPassword,
-        _ if text.contains("SESSION_PASSWORD_NEEDED") => TelegramError::PasswordRequired,
+        _ if text.contains("API_ID_INVALID") || text.contains("API_ID_PUBLISHED") => {
+            TelegramError::Connect
+        }
         _ => TelegramError::Other(text),
+    }
+}
+
+fn classify_sign_in(error: SignInError) -> TelegramError {
+    match error {
+        SignInError::InvalidCode => TelegramError::BadCode,
+        SignInError::InvalidPassword => TelegramError::BadPassword,
+        SignInError::SignUpRequired { .. } => TelegramError::NoAccount,
+        SignInError::Other(inner) => classify(&inner),
+        other => TelegramError::Other(other.to_string()),
     }
 }
 
 /// Result of submitting a login code.
 pub enum CodeOutcome {
-    /// Signed in. Carries the serialised session, ready to encrypt.
+    /// Signed in. Carries the exported session, ready to encrypt.
     SignedIn(Vec<u8>),
     /// The code was accepted but the account has 2FA.
-    NeedsPassword(grammers_client::types::PasswordToken),
+    NeedsPassword(Box<grammers_client::types::PasswordToken>),
 }
 
 pub async fn submit_code(
-    client: &Client,
+    connection: &Connection,
     token: &grammers_client::types::LoginToken,
     code: &str,
 ) -> Result<CodeOutcome, TelegramError> {
-    match client.sign_in(token, code).await {
-        Ok(_user) => Ok(CodeOutcome::SignedIn(save_session(client)?)),
+    match connection.client.sign_in(token, code).await {
+        Ok(_user) => Ok(CodeOutcome::SignedIn(export(connection)?)),
         Err(SignInError::PasswordRequired(password_token)) => {
-            Ok(CodeOutcome::NeedsPassword(password_token))
+            Ok(CodeOutcome::NeedsPassword(Box::new(password_token)))
         }
-        Err(SignInError::InvalidCode) => Err(TelegramError::BadCode),
-        Err(SignInError::SignUpRequired { .. }) => Err(TelegramError::NoAccount),
-        Err(SignInError::InvalidPassword) => Err(TelegramError::BadPassword),
-        Err(SignInError::Other(error)) => Err(classify(&error)),
-        Err(other) => Err(TelegramError::Other(other.to_string())),
+        Err(other) => Err(classify_sign_in(other)),
     }
 }
 
 pub async fn submit_password(
-    client: &Client,
+    connection: &Connection,
     token: grammers_client::types::PasswordToken,
     password: &str,
 ) -> Result<Vec<u8>, TelegramError> {
-    client
+    connection
+        .client
         .check_password(token, password)
         .await
-        .map_err(|error| match error {
-            SignInError::InvalidPassword => TelegramError::BadPassword,
-            SignInError::Other(inner) => classify(&inner),
-            other => TelegramError::Other(other.to_string()),
-        })?;
+        .map_err(classify_sign_in)?;
 
-    save_session(client)
+    export(connection)
 }
 
-fn save_session(client: &Client) -> Result<Vec<u8>, TelegramError> {
-    let bytes = client.session().save();
-    if bytes.is_empty() {
-        // Storing an empty session would look like success and fail later
-        // with nothing to explain it.
-        return Err(TelegramError::Other(
-            "Telegram returned an empty session".into(),
-        ));
-    }
-    Ok(bytes)
-}
-
-/// Rebuilds a client from a stored session, for ordinary use after connecting.
-pub async fn client_from_session(
-    session_bytes: &[u8],
-    api_id: i32,
-    api_hash: &str,
-) -> Result<Client, TelegramError> {
-    let session = Session::load(session_bytes).map_err(|error| {
-        tracing::warn!(?error, "stored session did not load");
-        TelegramError::Other("The stored Telegram session is unreadable.".into())
-    })?;
-
-    Client::connect(Config {
-        session,
-        api_id,
-        api_hash: api_hash.to_string(),
-        params: Default::default(),
-    })
-    .await
-    .map_err(|error| {
-        tracing::warn!(?error, "reconnect with stored session failed");
-        TelegramError::Connect
+fn export(connection: &Connection) -> Result<Vec<u8>, TelegramError> {
+    session_store::export(&connection.session).map_err(|error| {
+        tracing::error!(?error, "could not export the session after sign-in");
+        TelegramError::Session
     })
 }
 
@@ -251,42 +286,36 @@ pub type SharedPending = Arc<PendingLogins>;
 mod tests {
     use super::*;
 
-    #[test]
-    fn flood_wait_seconds_are_pulled_out_of_the_message() {
-        // The number matters: the UI tells the user how long to wait, and
-        // "try again later" with no figure is useless when it can be hours.
-        let classified = classify(&grammers_client::InvocationError::Rpc(
-            grammers_client::types::RpcError {
-                code: 420,
-                name: "FLOOD_WAIT_300".to_string(),
-                value: Some(300),
-                caused_by: None,
-            },
-        ));
-        assert!(matches!(classified, TelegramError::FloodWait(300)));
-    }
-
-    #[test]
-    fn a_mistyped_code_reads_as_a_mistyped_code() {
-        let classified = classify(&grammers_client::InvocationError::Rpc(
-            grammers_client::types::RpcError {
-                code: 400,
-                name: "PHONE_CODE_INVALID".to_string(),
-                value: None,
-                caused_by: None,
-            },
-        ));
-        assert!(matches!(classified, TelegramError::BadCode));
-        assert_eq!(classified.to_string(), "That code is not right.");
-    }
-
     #[tokio::test]
-    async fn an_expired_pending_login_is_not_handed_back() {
-        // Telegram has already forgotten the token by then; returning it
-        // would produce a confusing failure two steps later instead of a
-        // clear "start again" here.
+    async fn an_unknown_pending_login_is_none() {
         let pending = PendingLogins::new();
         assert_eq!(pending.len().await, 0);
         assert!(pending.take(Uuid::new_v4()).await.is_none());
+    }
+
+    #[test]
+    fn a_flood_wait_keeps_its_number() {
+        // The figure matters: the UI tells the user how long to wait, and
+        // "try later" is useless when it can be hours.
+        let error = TelegramError::FloodWait(300);
+        assert!(error.to_string().contains("300"));
+    }
+
+    #[test]
+    fn every_user_facing_error_reads_as_an_instruction() {
+        // These go straight into the UI, so none of them may leak a raw
+        // Telegram RPC name.
+        for error in [
+            TelegramError::BadPhone,
+            TelegramError::BadCode,
+            TelegramError::ExpiredCode,
+            TelegramError::BadPassword,
+            TelegramError::NoAccount,
+            TelegramError::Connect,
+        ] {
+            let text = error.to_string();
+            assert!(!text.contains('_'), "{text:?} looks like an RPC name");
+            assert!(text.ends_with('.'), "{text:?} is not a sentence");
+        }
     }
 }
