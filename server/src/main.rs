@@ -34,6 +34,8 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
 
+    warn_if_no_admin_possible(&pool, &config).await;
+
     let bind_addr = config.bind_addr.clone();
     tracing::info!(%bind_addr, base_url = %config.public_base_url, "starting");
 
@@ -65,4 +67,33 @@ async fn main() -> anyhow::Result<()> {
 /// through nginx.
 async fn health() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Says so loudly if this deployment can never produce an administrator.
+///
+/// With no active admin and no BOOTSTRAP_ADMIN_EMAIL set, every signup lands
+/// on `pending` and there is nobody who can approve them -- the service
+/// looks fine and is quietly unusable. Cheaper to notice in the boot log
+/// than after onboarding someone.
+async fn warn_if_no_admin_possible(pool: &db::Db, config: &Config) {
+    let admins: Result<i64, _> =
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'admin' AND status = 'active'")
+            .fetch_one(pool)
+            .await;
+
+    match admins {
+        Ok(0) if config.bootstrap_admin_email.is_none() => {
+            tracing::warn!(
+                "no active administrator exists and BOOTSTRAP_ADMIN_EMAIL is not set -- \
+                 every signup will sit on 'pending' with nobody able to approve it. \
+                 Set BOOTSTRAP_ADMIN_EMAIL and register that address."
+            );
+        }
+        Ok(0) => tracing::info!(
+            admin = %config.bootstrap_admin_email.as_deref().unwrap_or("?"),
+            "no administrator yet -- register this address to claim it"
+        ),
+        Ok(count) => tracing::info!(count, "active administrators"),
+        Err(error) => tracing::warn!(?error, "could not count administrators"),
+    }
 }

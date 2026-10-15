@@ -1,0 +1,111 @@
+import { useEffect, useState } from "react";
+import { HardDrive, LogOut, Shield } from "lucide-react";
+import { api, ApiError, type User } from "./api";
+import { Admin } from "./pages/Admin";
+import { SignIn } from "./pages/SignIn";
+import { Button, Card, Spinner } from "./ui";
+
+type View = "drive" | "admin";
+
+export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [checking, setChecking] = useState(true);
+  const [view, setView] = useState<View>("drive");
+
+  // Ask the server who we are on load. The session is an HttpOnly cookie, so
+  // this is the only way to know — there is nothing readable in JS to check.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .me()
+      .then((me) => {
+        if (!cancelled) setUser(me);
+      })
+      .catch((caught) => {
+        // 401 just means "not signed in", which is the normal first visit.
+        if (!(caught instanceof ApiError && caught.isAuthProblem)) {
+          console.error("could not resolve session", caught);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setChecking(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (checking) return <Spinner />;
+  if (!user) return <SignIn onSignedIn={setUser} />;
+
+  return (
+    <div className="min-h-full bg-canvas">
+      <header className="border-b border-border bg-surface">
+        <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-3">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-7 w-7 items-center justify-center rounded-[var(--radius-control)] bg-accent">
+              <HardDrive className="h-4 w-4 text-white" />
+            </div>
+            <span className="text-sm font-semibold text-ink">
+              Normless Drive
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {user.role === "admin" && (
+              <Button
+                variant="ghost"
+                onClick={() => setView(view === "admin" ? "drive" : "admin")}
+              >
+                <Shield className="h-3.5 w-3.5" />
+                {view === "admin" ? "Back to drive" : "Admin"}
+              </Button>
+            )}
+            <span className="hidden text-xs text-ink-muted sm:inline">
+              {user.email}
+            </span>
+            <Button
+              variant="ghost"
+              onClick={async () => {
+                await api.logout().catch(() => undefined);
+                setUser(null);
+                setView("drive");
+              }}
+            >
+              <LogOut className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+      </header>
+
+      {view === "admin" && user.role === "admin" ? (
+        <Admin me={user} />
+      ) : (
+        <Placeholder />
+      )}
+    </div>
+  );
+}
+
+/// The file browser is not built yet. Saying so plainly beats an empty page
+/// that looks broken.
+function Placeholder() {
+  return (
+    <div className="mx-auto max-w-5xl px-4 py-12">
+      <Card className="px-6 py-12 text-center">
+        <h2 className="text-base font-semibold text-ink">
+          Connect your Telegram account
+        </h2>
+        <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-ink-muted">
+          Your files are stored in your own Telegram account. Once the
+          connection flow is built, this is where you will link it and browse
+          your drive.
+        </p>
+        <p className="mx-auto mt-4 max-w-md text-xs text-ink-faint">
+          Not built yet — accounts and administration are working, file
+          handling is next.
+        </p>
+      </Card>
+    </div>
+  );
+}

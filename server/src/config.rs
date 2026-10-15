@@ -18,6 +18,14 @@ pub struct Config {
     /// Set `true` behind TLS so the session cookie carries `Secure`. Only
     /// false for local development over plain HTTP.
     pub cookie_secure: bool,
+    /// The one email address that is made an active administrator when it
+    /// registers. Everyone else lands on `pending` regardless of order.
+    ///
+    /// Without this the only workable rule is "whoever registers first wins",
+    /// and the hostname is in public DNS — so a stranger who finds the site
+    /// before the owner does would own it. Stored folded to lowercase to
+    /// match how `users.email` is compared.
+    pub bootstrap_admin_email: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,13 +68,30 @@ impl Config {
         let public_base_url = required("PUBLIC_BASE_URL")?;
         let public_base_url = public_base_url.trim_end_matches('/').to_string();
 
+        let bootstrap_admin_email = env::var("BOOTSTRAP_ADMIN_EMAIL")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             bind_addr: env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             public_base_url,
             session_ttl_hours: optional_parsed("SESSION_TTL_HOURS", "number of hours", 24 * 14)?,
             cookie_secure: optional_parsed("COOKIE_SECURE", "boolean", true)?,
+            bootstrap_admin_email,
         })
+    }
+
+    /// Whether this address should be granted admin on registration.
+    ///
+    /// Returns false for every address when no bootstrap email is set, so an
+    /// unconfigured deployment creates no administrator at all rather than
+    /// handing the role to whoever arrives first.
+    pub fn is_bootstrap_admin(&self, email: &str) -> bool {
+        self.bootstrap_admin_email
+            .as_deref()
+            .is_some_and(|configured| configured == email.trim().to_ascii_lowercase())
     }
 }
 
@@ -125,16 +150,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_the_configured_address_bootstraps_to_admin() {
+        temp_env(
+            &[
+                ("PUBLIC_BASE_URL", "https://x.test"),
+                ("DATABASE_URL", "postgres://x/y"),
+                ("BOOTSTRAP_ADMIN_EMAIL", "  Ashraf@Normless.in "),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                // Folded and trimmed on both sides, so the casing someone
+                // happens to type at the signup form does not decide
+                // whether they get the service.
+                assert!(config.is_bootstrap_admin("ashraf@normless.in"));
+                assert!(config.is_bootstrap_admin("ASHRAF@NORMLESS.IN"));
+                assert!(!config.is_bootstrap_admin("someone@else.com"));
+            },
+        );
+    }
+
+    #[test]
+    fn with_no_bootstrap_email_nobody_is_an_admin() {
+        // The failure mode to avoid is a deployment that silently hands the
+        // first visitor the keys. No configuration means no admin, and the
+        // owner has to say who it is.
+        temp_env(
+            &[
+                ("PUBLIC_BASE_URL", "https://x.test"),
+                ("DATABASE_URL", "postgres://x/y"),
+            ],
+            || {
+                let config = Config::from_env().unwrap();
+                assert!(!config.is_bootstrap_admin("anyone@at.all"));
+                assert!(!config.is_bootstrap_admin(""));
+            },
+        );
+    }
+
     /// Sets the given variables for the duration of `body`, clearing every
     /// variable this module reads first so tests do not inherit each other's
     /// state or the developer's shell.
     fn temp_env(vars: &[(&str, &str)], body: impl FnOnce()) {
-        const ALL: [&str; 5] = [
+        const ALL: [&str; 6] = [
             "DATABASE_URL",
             "BIND_ADDR",
             "PUBLIC_BASE_URL",
             "SESSION_TTL_HOURS",
             "COOKIE_SECURE",
+            "BOOTSTRAP_ADMIN_EMAIL",
         ];
         for name in ALL {
             env::remove_var(name);

@@ -53,6 +53,7 @@ struct RegisterResponse {
 async fn register(
     body: web::Json<Credentials>,
     pool: web::Data<Db>,
+    config: web::Data<Config>,
 ) -> ApiResult<HttpResponse> {
     let email = normalize_email(&body.email).map_err(ApiError::BadRequest)?;
     validate_password(&body.password).map_err(ApiError::BadRequest)?;
@@ -60,13 +61,10 @@ async fn register(
     let password_hash = hash_password(&body.password)
         .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
 
-    // The very first account to register becomes the admin. Otherwise a
-    // fresh deployment has nobody who can approve anyone, including
-    // themselves, and the service is permanently locked.
-    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
-        .fetch_one(pool.get_ref())
-        .await?;
-    let (role, status) = if existing == 0 {
+    // Admin is granted by configured address, never by arrival order. The
+    // hostname is in public DNS, so "first to register wins" would mean a
+    // stranger who found the site before its owner would own it.
+    let (role, status) = if config.is_bootstrap_admin(&email) {
         (Role::Admin, Status::Active)
     } else {
         (Role::User, Status::Pending)
@@ -105,7 +103,7 @@ async fn register(
             status,
         },
         message: if status.may_sign_in() {
-            "Account created. You are the first user, so you are the administrator."
+            "Account created. You are the configured administrator and can sign in now."
         } else {
             "Account created. An administrator must approve it before you can sign in."
         },
