@@ -1,0 +1,64 @@
+# /etc/systemd/system/normless-drive.service
+#
+#   sudo cp normless-drive.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now normless-drive
+
+[Unit]
+Description=Normless Drive
+Documentation=https://github.com/AshrafHanzo/normless_drive
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=normlessdrive
+Group=normlessdrive
+WorkingDirectory=/opt/normless-drive
+
+# Holds the database password and the bootstrap admin password, so it must
+# not be world readable. 0600, owned by the service account.
+EnvironmentFile=/opt/normless-drive/.env
+
+ExecStart=/opt/normless-drive/bin/normless-drive
+
+Restart=on-failure
+RestartSec=5s
+# Give up after repeated rapid failures instead of hammering the database
+# with a crash loop — a stopped unit is easier to notice than a spinning one.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# --- Hardening. This process proxies files between browsers and Telegram;
+# --- it has no business reading the rest of the filesystem.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+
+# ProtectSystem=strict makes everything read-only; name the one directory
+# that genuinely needs writing. Nothing under /root or the CRM is reachable.
+ReadWritePaths=/opt/normless-drive
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=normless-drive
+
+[Install]
+WantedBy=multi-user.target
