@@ -1,0 +1,28 @@
+# Rust
+/server/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+/web/dist/
+/web/.vite/
+
+# Secrets and local config. The .env on the VPS holds the database password
+# and every user's data depends on it staying out of this repo.
+.env
+.env.*
+!.env.example
+
+# Signing / keys
+*.key
+*.pem
+!*.pem.pub
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
