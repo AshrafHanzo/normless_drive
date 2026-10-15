@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { HardDrive } from "lucide-react";
 import { api, ApiError, type User } from "../api";
-import { Alert, Button, Card, Field } from "../ui";
+import { Alert, Button, Card, Field, PasswordField } from "../ui";
 
 type Mode = "signin" | "register";
 
@@ -75,9 +75,8 @@ export function SignIn({ onSignedIn }: { onSignedIn: (user: User) => void }) {
               placeholder="you@example.com"
             />
 
-            <Field
+            <PasswordField
               label="Password"
-              type="password"
               autoComplete={
                 mode === "signin" ? "current-password" : "new-password"
               }

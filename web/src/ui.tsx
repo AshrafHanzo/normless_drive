@@ -1,8 +1,8 @@
 // Shared primitives. Small on purpose — enough to keep the pages consistent
 // without becoming a component library nobody asked for.
 
-import type { ReactNode } from "react";
-import { Loader2 } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { Eye, EyeOff, Loader2 } from "lucide-react";
 
 export function Button({
   children,
@@ -56,6 +56,53 @@ export function Field({
                    transition-colors placeholder:text-ink-faint
                    focus:border-accent"
       />
+      {hint && <span className="mt-1 block text-xs text-ink-faint">{hint}</span>}
+    </label>
+  );
+}
+
+/// A password input with a reveal toggle.
+///
+/// Separate from `Field` rather than a flag on it, because the toggle needs
+/// its own state and the input needs right padding to clear the button --
+/// conditionally applying both inside `Field` makes that component worse for
+/// every other use.
+export function PasswordField({
+  label,
+  hint,
+  ...rest
+}: { label: string; hint?: string } & React.InputHTMLAttributes<HTMLInputElement>) {
+  const [revealed, setRevealed] = useState(false);
+  const Icon = revealed ? EyeOff : Eye;
+
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-xs font-medium text-ink-muted">
+        {label}
+      </span>
+      <div className="relative">
+        <input
+          {...rest}
+          type={revealed ? "text" : "password"}
+          className="w-full rounded-[var(--radius-control)] border border-border
+                     bg-canvas py-2 pl-3 pr-10 text-sm text-ink outline-none
+                     transition-colors placeholder:text-ink-faint
+                     focus:border-accent"
+        />
+        <button
+          type="button"
+          onClick={() => setRevealed((shown) => !shown)}
+          // Without this the button is a tab stop between the password field
+          // and the submit button, which breaks typing straight through the
+          // form.
+          tabIndex={-1}
+          aria-label={revealed ? "Hide password" : "Show password"}
+          className="absolute inset-y-0 end-0 flex w-10 items-center justify-center
+                     text-ink-faint transition-colors hover:text-ink"
+        >
+          <Icon className="h-4 w-4" />
+        </button>
+      </div>
       {hint && <span className="mt-1 block text-xs text-ink-faint">{hint}</span>}
     </label>
   );
