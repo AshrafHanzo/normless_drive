@@ -26,6 +26,16 @@ pub struct Config {
     /// before the owner does would own it. Stored folded to lowercase to
     /// match how `users.email` is compared.
     pub bootstrap_admin_email: Option<String>,
+    /// Password for the bootstrap administrator, used **once** to create that
+    /// account at startup if it does not already exist.
+    ///
+    /// Never used to change an existing account's password: otherwise a
+    /// stale value left in the environment would silently reset the admin
+    /// password on every restart, undoing any later change.
+    ///
+    /// It sits in plaintext in the environment for as long as it is set, so
+    /// the app asks to have it removed once the account exists.
+    pub bootstrap_admin_password: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +90,12 @@ impl Config {
             session_ttl_hours: optional_parsed("SESSION_TTL_HOURS", "number of hours", 24 * 14)?,
             cookie_secure: optional_parsed("COOKIE_SECURE", "boolean", true)?,
             bootstrap_admin_email,
+            // Not trimmed: a leading or trailing space is a legitimate part
+            // of a password, and silently stripping it would lock the owner
+            // out of an account they created with one.
+            bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty()),
         })
     }
 
@@ -188,17 +204,30 @@ mod tests {
         );
     }
 
+    /// Environment variables are process-global, and the test harness runs
+    /// tests on parallel threads — so without this every env test races
+    /// every other one, clearing variables a neighbour just set. The
+    /// failures that produces look like bugs in `Config` rather than in the
+    /// tests, which is exactly how much time they waste.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Sets the given variables for the duration of `body`, clearing every
     /// variable this module reads first so tests do not inherit each other's
     /// state or the developer's shell.
     fn temp_env(vars: &[(&str, &str)], body: impl FnOnce()) {
-        const ALL: [&str; 6] = [
+        // A panicking test poisons the lock; the guard is still what we need,
+        // and failing every later test because an earlier one failed would
+        // just hide the original error.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        const ALL: [&str; 7] = [
             "DATABASE_URL",
             "BIND_ADDR",
             "PUBLIC_BASE_URL",
             "SESSION_TTL_HOURS",
             "COOKIE_SECURE",
             "BOOTSTRAP_ADMIN_EMAIL",
+            "BOOTSTRAP_ADMIN_PASSWORD",
         ];
         for name in ALL {
             env::remove_var(name);

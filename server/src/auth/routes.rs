@@ -24,6 +24,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/register", web::post().to(register))
             .route("/login", web::post().to(login))
             .route("/logout", web::post().to(logout))
+            .route("/password", web::post().to(change_password))
             .route("/me", web::get().to(me)),
     );
 }
@@ -202,6 +203,117 @@ async fn logout(
     Ok(HttpResponse::Ok()
         .cookie(session_cookie("", &config, -1))
         .json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+pub struct PasswordChange {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Changes the account password, re-wrapping the stored Telegram session so
+/// it stays readable.
+///
+/// This is the one operation that must touch `tg_sessions`. The session is
+/// encrypted under a key derived from the password (see `crate::crypto`), so
+/// changing the password without re-wrapping would leave a row that nothing
+/// can ever decrypt again — the user's Telegram connection would be silently
+/// destroyed and they would only find out the next time they used it.
+async fn change_password(
+    user: CurrentUser,
+    body: web::Json<PasswordChange>,
+    pool: web::Data<Db>,
+) -> ApiResult<HttpResponse> {
+    validate_password(&body.new_password).map_err(ApiError::BadRequest)?;
+
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_one(pool.get_ref())
+        .await?;
+
+    let ok = verify_password(&body.current_password, &stored)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+    if !ok {
+        return Err(ApiError::Forbidden("Your current password is wrong.".into()));
+    }
+
+    let new_hash = hash_password(&body.new_password)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+
+    // Everything below has to land together: a password updated without its
+    // session re-wrapped is an unrecoverable state, so it goes in one
+    // transaction that either fully applies or does not happen at all.
+    let mut tx = pool.begin().await?;
+
+    let session_row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        "SELECT session_enc, session_nonce, api_hash_enc, api_hash_nonce, kdf_salt
+         FROM tg_sessions WHERE user_id = $1 FOR UPDATE",
+    )
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((session_enc, session_nonce, api_hash_enc, api_hash_nonce, salt)) = session_row {
+        let old_key = crate::crypto::derive_key(&body.current_password, &salt)
+            .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+
+        // A failure here means the stored session was already unreadable,
+        // which is a fault worth surfacing rather than papering over by
+        // dropping the row.
+        let session = crate::crypto::decrypt(&old_key, &session_enc, &session_nonce)
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("stored session did not decrypt")))?;
+        let api_hash = crate::crypto::decrypt(&old_key, &api_hash_enc, &api_hash_nonce)
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("stored api hash did not decrypt")))?;
+
+        // A fresh salt as well as a fresh key: no reason to keep the old one
+        // around once everything under it is being rewritten.
+        let new_salt = crate::crypto::generate_salt();
+        let new_key = crate::crypto::derive_key(&body.new_password, &new_salt)
+            .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+
+        let (session_enc, session_nonce) = crate::crypto::encrypt(&new_key, &session)
+            .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+        let (api_hash_enc, api_hash_nonce) = crate::crypto::encrypt(&new_key, &api_hash)
+            .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+
+        sqlx::query(
+            "UPDATE tg_sessions
+             SET session_enc = $1, session_nonce = $2,
+                 api_hash_enc = $3, api_hash_nonce = $4, kdf_salt = $5
+             WHERE user_id = $6",
+        )
+        .bind(&session_enc)
+        .bind(&session_nonce)
+        .bind(&api_hash_enc)
+        .bind(&api_hash_nonce)
+        .bind(new_salt.as_slice())
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&new_hash)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Every other login is invalidated: a password change is how someone
+    // responds to a session they think is stolen, so leaving the rest alive
+    // would defeat the point.
+    sqlx::query("DELETE FROM app_sessions WHERE user_id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    audit(pool.get_ref(), Some(user.id), Some(user.id), "user.password_changed", None).await;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "message": "Password changed. Please sign in again."
+    })))
 }
 
 async fn me(user: CurrentUser, pool: web::Data<Db>) -> ApiResult<HttpResponse> {

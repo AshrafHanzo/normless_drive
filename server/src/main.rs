@@ -34,6 +34,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
 
+    seed_bootstrap_admin(&pool, &config).await?;
     warn_if_no_admin_possible(&pool, &config).await;
 
     let bind_addr = config.bind_addr.clone();
@@ -67,6 +68,70 @@ async fn main() -> anyhow::Result<()> {
 /// through nginx.
 async fn health() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
+}
+
+/// Creates the administrator account from the environment, once.
+///
+/// Only ever inserts. If the address already exists this does nothing and
+/// says so — a password left in the environment must not quietly reset the
+/// account on every restart, which would undo any password change made
+/// afterwards and would mean the plaintext in `.env` stays live forever.
+async fn seed_bootstrap_admin(pool: &db::Db, config: &Config) -> anyhow::Result<()> {
+    let (Some(email), Some(password)) = (
+        config.bootstrap_admin_email.as_deref(),
+        config.bootstrap_admin_password.as_deref(),
+    ) else {
+        return Ok(());
+    };
+
+    if let Err(reason) = auth::validate_password(password) {
+        anyhow::bail!("BOOTSTRAP_ADMIN_PASSWORD is not acceptable: {reason}");
+    }
+
+    let existing: Option<(uuid::Uuid, String, String)> =
+        sqlx::query_as("SELECT id, role, status FROM users WHERE lower(email) = lower($1)")
+            .bind(email)
+            .fetch_optional(pool)
+            .await?;
+
+    if let Some((id, role, status)) = existing {
+        // The account is already there. Make sure it is usable — an admin
+        // who suspended themselves by accident, or who existed as a normal
+        // user before being named in the environment, should be repaired
+        // rather than left locked out. The password is untouched.
+        if role != "admin" || status != "active" {
+            sqlx::query("UPDATE users SET role = 'admin', status = 'active' WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+            tracing::warn!(%email, "restored the configured administrator to active admin");
+        }
+        tracing::info!(
+            "administrator already exists -- remove BOOTSTRAP_ADMIN_PASSWORD from the \
+             environment, it is no longer used and is plaintext on disk"
+        );
+        return Ok(());
+    }
+
+    let hash = auth::hash_password(password)
+        .map_err(|error| anyhow::anyhow!("could not hash the bootstrap password: {error}"))?;
+
+    sqlx::query(
+        "INSERT INTO users (email, password_hash, role, status)
+         VALUES ($1, $2, 'admin', 'active')",
+    )
+    .bind(email)
+    .bind(&hash)
+    .execute(pool)
+    .await?;
+
+    tracing::warn!(
+        %email,
+        "created the administrator account. Sign in, change this password, then \
+         remove BOOTSTRAP_ADMIN_PASSWORD from the environment."
+    );
+
+    Ok(())
 }
 
 /// Says so loudly if this deployment can never produce an administrator.
