@@ -38,8 +38,9 @@ pub struct AdminUserRow {
 }
 
 async fn list_users(_admin: AdminUser, pool: web::Data<Db>) -> ApiResult<HttpResponse> {
-    let rows: Vec<(Uuid, String, String, String, DateTime<Utc>, Option<DateTime<Utc>>, bool)> =
-        sqlx::query_as(
+    let client = pool.get().await?;
+    let rows = client
+        .query(
             "SELECT u.id, u.email, u.role, u.status, u.created_at, u.last_login_at,
                     (t.user_id IS NOT NULL) AS telegram_connected
              FROM users u
@@ -48,25 +49,21 @@ async fn list_users(_admin: AdminUser, pool: web::Data<Db>) -> ApiResult<HttpRes
                  -- Pending first: the queue an admin actually has to act on.
                  CASE u.status WHEN 'pending' THEN 0 ELSE 1 END,
                  u.created_at DESC",
+            &[],
         )
-        .fetch_all(pool.get_ref())
         .await?;
 
     let users: Vec<AdminUserRow> = rows
-        .into_iter()
-        .map(
-            |(id, email, role, status, created_at, last_login_at, telegram_connected)| {
-                AdminUserRow {
-                    id,
-                    email,
-                    role,
-                    status,
-                    created_at,
-                    last_login_at,
-                    telegram_connected,
-                }
-            },
-        )
+        .iter()
+        .map(|row| AdminUserRow {
+            id: row.get("id"),
+            email: row.get("email"),
+            role: row.get("role"),
+            status: row.get("status"),
+            created_at: row.get("created_at"),
+            last_login_at: row.get("last_login_at"),
+            telegram_connected: row.get("telegram_connected"),
+        })
         .collect();
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "users": users })))
@@ -95,12 +92,13 @@ async fn set_status(
         ));
     }
 
-    let affected = sqlx::query("UPDATE users SET status = $1 WHERE id = $2")
-        .bind(status.as_str())
-        .bind(target)
-        .execute(pool.get_ref())
-        .await?
-        .rows_affected();
+    let client = pool.get().await?;
+    let affected = client
+        .execute(
+            "UPDATE users SET status = $1 WHERE id = $2",
+            &[&status.as_str(), &target],
+        )
+        .await?;
 
     if affected == 0 {
         return Err(ApiError::NotFound("No such user.".into()));
@@ -110,14 +108,13 @@ async fn set_status(
     // keeps working until their cookie expires -- though `CurrentUser` also
     // re-checks status per request, so this is belt and braces.
     if !status.may_sign_in() {
-        sqlx::query("DELETE FROM app_sessions WHERE user_id = $1")
-            .bind(target)
-            .execute(pool.get_ref())
+        client
+            .execute("DELETE FROM app_sessions WHERE user_id = $1", &[&target])
             .await?;
     }
 
     audit(
-        pool.get_ref(),
+        &pool,
         Some(target),
         Some(admin.0.id),
         "admin.set_status",
@@ -152,13 +149,16 @@ async fn set_role(
     // Demoting the last admin leaves nobody who can approve signups or
     // promote anyone, and the only fix would be editing the database by
     // hand. Refuse rather than let that happen.
+    let client = pool.get().await?;
     if role != Role::Admin {
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM users WHERE role = 'admin' AND status = 'active' AND id <> $1",
-        )
-        .bind(target)
-        .fetch_one(pool.get_ref())
-        .await?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM users
+                  WHERE role = 'admin' AND status = 'active' AND id <> $1",
+                &[&target],
+            )
+            .await?;
+        let remaining: i64 = row.get(0);
         if remaining == 0 {
             return Err(ApiError::BadRequest(
                 "That is the only active administrator. Promote someone else first.".into(),
@@ -166,19 +166,19 @@ async fn set_role(
         }
     }
 
-    let affected = sqlx::query("UPDATE users SET role = $1 WHERE id = $2")
-        .bind(role.as_str())
-        .bind(target)
-        .execute(pool.get_ref())
-        .await?
-        .rows_affected();
+    let affected = client
+        .execute(
+            "UPDATE users SET role = $1 WHERE id = $2",
+            &[&role.as_str(), &target],
+        )
+        .await?;
 
     if affected == 0 {
         return Err(ApiError::NotFound("No such user.".into()));
     }
 
     audit(
-        pool.get_ref(),
+        &pool,
         Some(target),
         Some(admin.0.id),
         "admin.set_role",
@@ -202,18 +202,24 @@ async fn list_audit(
 ) -> ApiResult<HttpResponse> {
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
 
-    let rows: Vec<(i64, Option<Uuid>, Option<Uuid>, String, Option<serde_json::Value>, DateTime<Utc>)> =
-        sqlx::query_as(
+    let client = pool.get().await?;
+    let rows = client
+        .query(
             "SELECT id, user_id, actor_id, action, detail, created_at
              FROM audit ORDER BY created_at DESC LIMIT $1",
+            &[&limit],
         )
-        .bind(limit)
-        .fetch_all(pool.get_ref())
         .await?;
 
     let entries: Vec<serde_json::Value> = rows
-        .into_iter()
-        .map(|(id, user_id, actor_id, action, detail, created_at)| {
+        .iter()
+        .map(|row| {
+            let id: i64 = row.get("id");
+            let user_id: Option<Uuid> = row.get("user_id");
+            let actor_id: Option<Uuid> = row.get("actor_id");
+            let action: String = row.get("action");
+            let detail: Option<serde_json::Value> = row.get("detail");
+            let created_at: DateTime<Utc> = row.get("created_at");
             serde_json::json!({
                 "id": id,
                 "user_id": user_id,

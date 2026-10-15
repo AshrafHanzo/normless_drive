@@ -33,21 +33,30 @@ impl FromRequest for CurrentUser {
 
             let token_hash = hash_session_token(&cookie);
 
+            let client = pool
+                .get()
+                .await
+                .map_err(|error| ApiError::Internal(error.into()))?;
+
             // Expiry is filtered in SQL rather than compared in Rust so an
             // expired session is indistinguishable from a missing one, and
             // there is no window where a stale row is treated as valid.
-            let found: Option<(Uuid, String, String, String)> = sqlx::query_as(
-                "SELECT u.id, u.email, u.role, u.status
-                 FROM app_sessions s
-                 JOIN users u ON u.id = s.user_id
-                 WHERE s.token_hash = $1 AND s.expires_at > now()",
-            )
-            .bind(&token_hash)
-            .fetch_optional(pool.get_ref())
-            .await
-            .map_err(|error| ApiError::Internal(error.into()))?;
+            let found = client
+                .query_opt(
+                    "SELECT u.id, u.email, u.role, u.status
+                     FROM app_sessions s
+                     JOIN users u ON u.id = s.user_id
+                     WHERE s.token_hash = $1 AND s.expires_at > now()",
+                    &[&token_hash],
+                )
+                .await
+                .map_err(|error| ApiError::Internal(error.into()))?;
 
-            let (id, email, role, status) = found.ok_or(ApiError::Unauthenticated)?;
+            let row = found.ok_or(ApiError::Unauthenticated)?;
+            let id: Uuid = row.get("id");
+            let email: String = row.get("email");
+            let role: String = row.get("role");
+            let status: String = row.get("status");
 
             // Re-checked on every request, not just at login: suspending an
             // account has to take effect immediately, not whenever their

@@ -12,6 +12,15 @@ mod db;
 mod error;
 mod keycache;
 
+// Parked, not abandoned. The module is written against the grammers API I
+// expected rather than the one at the pinned revision: there, a `Session` is
+// a trait over live state (not a saveable blob), and a client is built as
+// `SenderPool::new(session, n)` + `Client::new(&pool)` with the pool's
+// runner spawned as a task. Reworking it is the next commit. Left in the
+// tree rather than deleted so the guide text, the error translation and the
+// pending-login store are not written twice.
+// mod telegram;
+
 use actix_web::{middleware::Logger, web, App, HttpResponse, HttpServer};
 use config::Config;
 
@@ -106,21 +115,29 @@ async fn seed_bootstrap_admin(pool: &db::Db, config: &Config) -> anyhow::Result<
         anyhow::bail!("BOOTSTRAP_ADMIN_PASSWORD is not acceptable: {reason}");
     }
 
-    let existing: Option<(uuid::Uuid, String, String)> =
-        sqlx::query_as("SELECT id, role, status FROM users WHERE lower(email) = lower($1)")
-            .bind(email)
-            .fetch_optional(pool)
-            .await?;
+    let client = pool.get().await?;
+    let existing = client
+        .query_opt(
+            "SELECT id, role, status FROM users WHERE lower(email) = lower($1)",
+            &[&email],
+        )
+        .await?;
 
-    if let Some((id, role, status)) = existing {
+    if let Some(row) = existing {
+        let id: uuid::Uuid = row.get("id");
+        let role: String = row.get("role");
+        let status: String = row.get("status");
+
         // The account is already there. Make sure it is usable — an admin
         // who suspended themselves by accident, or who existed as a normal
         // user before being named in the environment, should be repaired
         // rather than left locked out. The password is untouched.
         if role != "admin" || status != "active" {
-            sqlx::query("UPDATE users SET role = 'admin', status = 'active' WHERE id = $1")
-                .bind(id)
-                .execute(pool)
+            client
+                .execute(
+                    "UPDATE users SET role = 'admin', status = 'active' WHERE id = $1",
+                    &[&id],
+                )
                 .await?;
             tracing::warn!(%email, "restored the configured administrator to active admin");
         }
@@ -134,14 +151,17 @@ async fn seed_bootstrap_admin(pool: &db::Db, config: &Config) -> anyhow::Result<
     let hash = auth::hash_password(password)
         .map_err(|error| anyhow::anyhow!("could not hash the bootstrap password: {error}"))?;
 
-    sqlx::query(
-        "INSERT INTO users (email, password_hash, role, status)
-         VALUES ($1, $2, 'admin', 'active')",
-    )
-    .bind(email)
-    .bind(&hash)
-    .execute(pool)
-    .await?;
+    // Needs a kdf_salt like any other account: the wrapping key is derived
+    // from it at every login, and a NULL here would fail at sign-in rather
+    // than here, which is a much worse place to find out.
+    let kdf_salt = crypto::generate_salt();
+    client
+        .execute(
+            "INSERT INTO users (email, password_hash, role, status, kdf_salt)
+             VALUES ($1, $2, 'admin', 'active', $3)",
+            &[&email, &hash, &kdf_salt.as_slice()],
+        )
+        .await?;
 
     tracing::warn!(
         %email,
@@ -159,10 +179,17 @@ async fn seed_bootstrap_admin(pool: &db::Db, config: &Config) -> anyhow::Result<
 /// looks fine and is quietly unusable. Cheaper to notice in the boot log
 /// than after onboarding someone.
 async fn warn_if_no_admin_possible(pool: &db::Db, config: &Config) {
-    let admins: Result<i64, _> =
-        sqlx::query_scalar("SELECT count(*) FROM users WHERE role = 'admin' AND status = 'active'")
-            .fetch_one(pool)
-            .await;
+    let admins = async {
+        let client = pool.get().await?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM users WHERE role = 'admin' AND status = 'active'",
+                &[],
+            )
+            .await?;
+        Ok::<i64, anyhow::Error>(row.get(0))
+    }
+    .await;
 
     match admins {
         Ok(0) if config.bootstrap_admin_email.is_none() => {

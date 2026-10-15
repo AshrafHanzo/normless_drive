@@ -32,15 +32,27 @@ pub enum ApiError {
     Internal(#[from] anyhow::Error),
 }
 
-impl From<sqlx::Error> for ApiError {
-    fn from(error: sqlx::Error) -> Self {
-        // RowNotFound reaching a handler almost always means "this id does
-        // not exist", which is a 404 rather than a server fault.
-        match error {
-            sqlx::Error::RowNotFound => ApiError::NotFound("not found".into()),
-            other => ApiError::Internal(other.into()),
-        }
+impl From<tokio_postgres::Error> for ApiError {
+    fn from(error: tokio_postgres::Error) -> Self {
+        ApiError::Internal(error.into())
     }
+}
+
+impl From<deadpool_postgres::PoolError> for ApiError {
+    fn from(error: deadpool_postgres::PoolError) -> Self {
+        ApiError::Internal(error.into())
+    }
+}
+
+/// True when a database error is a unique-constraint violation.
+///
+/// Used to turn "that email is taken" into a 409 instead of a 500. SQLSTATE
+/// 23505 is the only reliable signal — the message text is localised and
+/// varies by server version.
+pub fn is_unique_violation(error: &tokio_postgres::Error) -> bool {
+    error
+        .code()
+        .is_some_and(|code| code == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
 }
 
 #[derive(Serialize)]
@@ -116,12 +128,6 @@ mod tests {
         // The Display impl is transparent, so the secret IS in the error --
         // the protection is that error_response does not use it.
         assert!(error.to_string().contains("hunter2"));
-    }
-
-    #[test]
-    fn a_missing_row_becomes_a_404_not_a_500() {
-        let error: ApiError = sqlx::Error::RowNotFound.into();
-        assert_eq!(error.status_code(), StatusCode::NOT_FOUND);
     }
 
     #[test]

@@ -9,15 +9,35 @@ actix-web = "4"
 actix-cors = "0.7"
 actix-files = "0.6"
 
-# Postgres. Runtime-checked queries (`query`/`query_as`) rather than the
-# compile-time `query!` macros, so a build does not need a reachable database.
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls",
-    "postgres",
-    "chrono",
-    "uuid",
-    "macros",
+# Postgres via tokio-postgres rather than sqlx.
+#
+# sqlx was the first choice and cannot be used here. Its optional SQLite
+# driver pulls libsqlite3-sys, which links the native `sqlite3` library, and
+# grammers-session depends *unconditionally* on the `sqlite` crate, which
+# links the same one. Cargo permits a single package per `links` value and
+# checks that before resolving features, so switching sqlx's sqlite feature
+# off does not help — the conflict exists in the graph either way.
+# tokio-postgres has no SQLite anywhere in its tree.
+tokio-postgres = { version = "0.7", features = [
+    "with-uuid-1",
+    "with-chrono-0_4",
+    "with-serde_json-1",
 ] }
+deadpool-postgres = "0.14"
+
+# Telegram MTProto. Pinned to the same revision the desktop app uses, so
+# behaviour and the session format match.
+#
+# The `serde` feature on grammers-session is what makes a session storable
+# here at all. A grammers `Session` is a trait over live state, not a blob:
+# the shipped implementations keep it in memory or in a SQLite file. Neither
+# suits a multi-user server — a file would mean writing every user's
+# plaintext session to disk, which is exactly what the encryption is for. So
+# the session is converted to `SessionData`, serialised, encrypted, and kept
+# in Postgres; nothing is ever written out in the clear.
+grammers-client = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
+grammers-session = { git = "https://github.com/Lonami/grammers", rev = "d07f96f", features = ["serde"] }
+grammers-tl-types = { git = "https://github.com/Lonami/grammers", rev = "d07f96f" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
