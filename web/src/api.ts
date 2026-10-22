@@ -232,6 +232,12 @@ export const api = {
         folder ? `/api/files?folder=${folder}` : "/api/files",
       ),
 
+    remove: (id: number, folder?: string) =>
+      request<{ ok: true }>(
+        folder ? `/api/files/${id}?folder=${folder}` : `/api/files/${id}`,
+        { method: "DELETE" },
+      ),
+
     downloadUrl: (id: number, folder?: string) =>
       folder
         ? `/api/files/${id}/download?folder=${folder}`
@@ -242,10 +248,18 @@ export const api = {
       form.append("file", file);
       // No Content-Type header: the browser must set it so the multipart
       // boundary is included, and overriding it breaks the upload.
-      const response = await fetch(
-        folder ? `/api/files?folder=${folder}` : "/api/files",
-        { method: "POST", credentials: "same-origin", body: form },
-      );
+      // The size travels in the query because Telegram needs the length
+      // before the transfer starts, and the browser is the only party that
+      // already knows it. Without this the server would have to buffer the
+      // whole file just to measure it.
+      const params = new URLSearchParams({ size: String(file.size) });
+      if (folder) params.set("folder", folder);
+
+      const response = await fetch(`/api/files?${params}`, {
+        method: "POST",
+        credentials: "same-origin",
+        body: form,
+      });
       if (!response.ok) {
         const body = await response.json().catch(() => null);
         const detail = (body as { error?: { code?: string; message?: string } })

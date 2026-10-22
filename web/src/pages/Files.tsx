@@ -8,6 +8,7 @@ import {
   FileVideo,
   FolderPlus,
   Share2,
+  Trash2,
   File as FileIcon,
   RotateCw,
   Unplug,
@@ -209,7 +210,12 @@ export function Files({
       ) : (
         <Card className="divide-y divide-border-soft">
           {files.map((file) => (
-            <Row key={file.id} file={file} folder={folder} />
+            <Row
+              key={file.id}
+              file={file}
+              folder={folder}
+              onDeleted={() => void load(folder)}
+            />
           ))}
         </Card>
       )}
@@ -253,10 +259,38 @@ function FolderTab({
   );
 }
 
-function Row({ file, folder }: { file: FileRow; folder: string | undefined }) {
+function Row({
+  file,
+  folder,
+  onDeleted,
+}: {
+  file: FileRow;
+  folder: string | undefined;
+  onDeleted: () => void;
+}) {
   const Icon = iconFor(file.mime_type, file.name);
+  const [deleting, setDeleting] = useState(false);
+
+  async function remove() {
+    // Telegram has no undo, so this asks before acting.
+    if (
+      !window.confirm(
+        `Delete "${file.name}"? This removes it from Telegram permanently.`,
+      )
+    ) {
+      return;
+    }
+    setDeleting(true);
+    try {
+      await api.files.remove(file.id, folder);
+      onDeleted();
+    } catch {
+      setDeleting(false);
+    }
+  }
+
   return (
-    <div className="flex items-center gap-3 px-4 py-3">
+    <div className="group flex items-center gap-3 px-4 py-3 transition-colors hover:bg-surface">
       <Icon className="h-4 w-4 shrink-0 text-ink-faint" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-ink" title={file.name}>
@@ -266,6 +300,18 @@ function Row({ file, folder }: { file: FileRow; folder: string | undefined }) {
           {formatSize(file.size)} · {new Date(file.date * 1000).toLocaleDateString()}
         </p>
       </div>
+      <button
+        onClick={() => void remove()}
+        disabled={deleting}
+        aria-label={`Delete ${file.name}`}
+        title="Delete permanently"
+        className="rounded-[var(--radius-control)] p-1.5 text-ink-faint opacity-0
+                   transition-all hover:bg-[var(--color-danger-soft)]
+                   hover:text-[var(--color-danger)] focus-visible:opacity-100
+                   disabled:opacity-40 group-hover:opacity-100"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </button>
       {/* A plain link, not fetch(): the browser streams it straight to disk
           with a real progress bar, and a 2 GB file never passes through JS
           memory. */}

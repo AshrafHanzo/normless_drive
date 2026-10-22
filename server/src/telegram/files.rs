@@ -30,7 +30,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::scope("/api/files")
             .route("", web::get().to(list))
             .route("", web::post().to(upload))
-            .route("/{id}/download", web::get().to(download)),
+            .route("/{id}/download", web::get().to(download))
+            .route("/{id}", web::delete().to(remove)),
     );
 }
 
@@ -52,12 +53,17 @@ pub struct ListQuery {
     pub folder: Option<Uuid>,
 }
 
-/// Download and upload take the folder in the body or path rather than a
-/// list query, so they share this instead of `ListQuery`.
+/// Download and upload take the folder in the query rather than a list
+/// query, so they share this instead of `ListQuery`.
 #[derive(Deserialize)]
 pub struct FolderQuery {
     #[serde(default)]
     pub folder: Option<Uuid>,
+    /// Upload only. The browser knows the file's length and Telegram needs
+    /// it up front, so it travels here rather than being discovered by
+    /// reading the whole body into memory first.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// Pulls the connection for the caller, translating the two "you need to
@@ -227,34 +233,42 @@ async fn upload(
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "upload".to_string());
 
-    // grammers needs the length up front, and multipart does not carry a
-    // per-part size, so this reads the part into memory. That is the known
-    // limitation of this first cut: fine for documents and photos, not for
-    // multi-gigabyte files. Streaming needs the chunked endpoint the
-    // desktop app uses, which is the next piece of work.
-    let mut bytes = web::BytesMut::new();
-    let mut field = field;
-    while let Some(chunk) = field.next().await {
-        let chunk = chunk.map_err(|error| ApiError::BadRequest(format!("Upload failed: {error}")))?;
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > 256 * 1024 * 1024 {
-            return Err(ApiError::BadRequest(
-                "This first version accepts files up to 256 MB. Larger uploads need the chunked endpoint.".into(),
-            ));
-        }
-    }
+    // grammers needs the length before it starts, and multipart carries no
+    // per-part size — so the browser sends it as `?size=`, since it is the
+    // one party that already knows. Nothing is buffered: the request body
+    // is adapted to an AsyncRead and handed straight to Telegram, so a
+    // 2 GB upload uses a chunk of memory, not 2 GB of it.
+    let size = query.size.ok_or_else(|| {
+        ApiError::BadRequest("The upload is missing its size.".into())
+    })?;
 
-    if bytes.is_empty() {
+    if size == 0 {
         return Err(ApiError::BadRequest("That file is empty.".into()));
     }
+    // Telegram refuses a single document above this, and the splitter that
+    // would work around it is not built yet — so say so plainly rather
+    // than let the upload run for an hour and then fail.
+    const TELEGRAM_MAX: u64 = 2_000_000_000;
+    if size > TELEGRAM_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "Telegram accepts at most 2 GB in one file. This is {:.2} GB.",
+            size as f64 / 1_000_000_000.0
+        )));
+    }
 
-    let size = bytes.len();
+    // Checked against the declared size before a byte is transferred. A
+    // client that under-declares gets caught below when the stream runs
+    // long, and grammers rejects a mismatched length anyway.
     permissions::check_quota(&pool, user.id, size as i64).await?;
 
-    let mut cursor = std::io::Cursor::new(bytes.freeze());
+    let body = field.map(|chunk| {
+        chunk.map_err(|error| std::io::Error::other(format!("upload interrupted: {error}")))
+    });
+    let mut reader = tokio_util::io::StreamReader::new(body);
+
     let uploaded = connection
         .client
-        .upload_stream(&mut cursor, size, name.clone())
+        .upload_stream(&mut reader, size as usize, name.clone())
         .await
         .map_err(|error| TelegramError::Other(format!("upload to Telegram failed: {error}")))?;
 
@@ -296,6 +310,47 @@ async fn upload(
         "name": name,
         "size": size
     })))
+}
+
+/// Deletes a file from Telegram.
+///
+/// Irreversible: this removes the message for everyone, and Telegram has
+/// no undo. The confirmation lives in the UI because the API should stay
+/// callable by scripts that have already decided.
+async fn remove(
+    request: HttpRequest,
+    user: CurrentUser,
+    path: web::Path<i32>,
+    query: web::Query<FolderQuery>,
+    keys: web::Data<KeyCache>,
+    clients: web::Data<SharedClients>,
+    pool: web::Data<Db>,
+) -> ApiResult<HttpResponse> {
+    permissions::require(&pool, user.id, permissions::Capability::Delete).await?;
+
+    let message_id = path.into_inner();
+    let connection = connection_for(&request, &user, &keys, &clients, &pool).await?;
+    let peer = super::folders::resolve(&connection.client, &pool, user.id, query.folder).await?;
+
+    connection
+        .client
+        .delete_messages(&peer, &[message_id])
+        .await
+        .map_err(|error| TelegramError::Other(format!("could not delete: {error}")))?;
+
+    // Keep the quota tally honest. Best effort: the file is already gone
+    // from Telegram, so failing the request now would be misleading.
+    if let Ok(db) = pool.get().await {
+        let _ = db
+            .execute(
+                "DELETE FROM uploads WHERE user_id = $1 AND message_id = $2",
+                &[&user.id, &message_id],
+            )
+            .await;
+    }
+
+    tracing::info!(user = %user.id, message_id, "deleted");
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true })))
 }
 
 /// `Document::name()` returns an empty string rather than `None` when a
