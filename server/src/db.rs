@@ -69,6 +69,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             "0003_folders_and_shares",
             include_str!("../migrations/0003_folders_and_shares.sql"),
         ),
+        (
+            "0004_offline_shares",
+            include_str!("../migrations/0004_offline_shares.sql"),
+        ),
     ];
 
     let client = pool.get().await?;

@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/ui.tsx","./src/pages/admin.tsx","./src/pages/connecttelegram.tsx","./src/pages/files.tsx","./src/pages/permissionseditor.tsx","./src/pages/signin.tsx"],"version":"5.8.3"}
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/ui.tsx","./src/pages/admin.tsx","./src/pages/connecttelegram.tsx","./src/pages/files.tsx","./src/pages/permissionseditor.tsx","./src/pages/publicshare.tsx","./src/pages/signin.tsx"],"version":"5.8.3"}

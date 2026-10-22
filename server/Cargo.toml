@@ -66,6 +66,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 hex = "0.4"
+# Share permissions are a bitfield, matching the desktop app's numbering so
+# a link means the same thing in both.
+bitflags = "2"
+# Comparing a share's unlock cookie without leaking a timing signal.
+constant_time_eq = "0.3"
 
 thiserror = "2"
 anyhow = "1"

@@ -12,6 +12,7 @@ mod db;
 mod error;
 mod keycache;
 mod permissions;
+mod shares;
 
 mod telegram;
 
@@ -82,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
             .configure(telegram::routes::configure)
             .configure(telegram::files::configure)
             .configure(telegram::folders::configure)
+            .configure(shares::routes::configure)
+            .configure(shares::public::configure)
             .configure(admin::configure)
     })
     .bind(&bind_addr)?

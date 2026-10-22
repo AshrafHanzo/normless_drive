@@ -36,6 +36,13 @@ pub struct Config {
     /// It sits in plaintext in the environment for as long as it is set, so
     /// the app asks to have it removed once the account exists.
     pub bootstrap_admin_password: Option<String>,
+    /// Secret used to wrap a second copy of a Telegram session so share
+    /// links keep working while their owner is signed out.
+    ///
+    /// Deliberately separate from the database: a stolen dump is useless
+    /// without it. Absent means offline sharing is simply unavailable —
+    /// that is a supported configuration, not an error.
+    pub share_secret: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,7 +103,26 @@ impl Config {
             bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD")
                 .ok()
                 .filter(|value| !value.is_empty()),
+            // A short secret would be brute-forceable offline against a
+            // stolen database, which is the one attack this is supposed to
+            // withstand. Refuse rather than offer weak protection.
+            share_secret: match env::var("SHARE_SECRET") {
+                Ok(value) if value.trim().len() >= 32 => Some(value.trim().to_string()),
+                Ok(value) if value.trim().is_empty() => None,
+                Ok(_) => {
+                    return Err(ConfigError::Invalid {
+                        name: "SHARE_SECRET",
+                        expected: "at least 32 characters",
+                        value: "<redacted>".to_string(),
+                    })
+                }
+                Err(_) => None,
+            },
         })
+    }
+
+    pub fn offline_sharing_available(&self) -> bool {
+        self.share_secret.is_some()
     }
 
     /// Whether this address should be granted admin on registration.

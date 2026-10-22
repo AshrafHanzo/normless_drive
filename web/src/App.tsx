@@ -1,15 +1,32 @@
-﻿import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { HardDrive, LogOut, Shield } from "lucide-react";
 import { api, ApiError, type User } from "./api";
 import { Admin } from "./pages/Admin";
 import { ConnectTelegram } from "./pages/ConnectTelegram";
 import { Files } from "./pages/Files";
+import { PublicShare } from "./pages/PublicShare";
 import { SignIn } from "./pages/SignIn";
 import { Button, Spinner } from "./ui";
 
 type View = "drive" | "admin";
 
 export default function App() {
+  // A share link is a different application: no account, no header, and it
+  // must not try to resolve a session. Decided before anything else runs
+  // so opening one never flashes the sign-in screen.
+  const shareToken = sharePathToken();
+  if (shareToken) return <PublicShare token={shareToken} />;
+
+  return <SignedInApp />;
+}
+
+/// Extracts the token from `/s/{token}`, or null for every other path.
+function sharePathToken(): string | null {
+  const match = window.location.pathname.match(/^\/s\/([A-Za-z0-9_-]+)\/?$/);
+  return match?.[1] ?? null;
+}
+
+function SignedInApp() {
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
   const [view, setView] = useState<View>("drive");

@@ -20,6 +20,28 @@ export interface AdminUserRow extends User {
   telegram_connected: boolean;
 }
 
+export interface SharePermissions {
+  can_upload: boolean;
+  can_download: boolean;
+  can_update: boolean;
+  can_delete: boolean;
+}
+
+export interface Share {
+  id: string;
+  token: string;
+  url: string;
+  label: string | null;
+  folder_id: string | null;
+  permissions: SharePermissions;
+  has_password: boolean;
+  expires_at: string | null;
+  usage_limit: number | null;
+  usage_count: number;
+  allow_offline: boolean;
+  created_at: string;
+}
+
 export interface Folder {
   id: string;
   channel_id: number;
@@ -146,6 +168,54 @@ export const api = {
   logout: () => request<{ ok: true }>("/api/auth/logout", { method: "POST" }),
 
   me: () => request<User>("/api/auth/me"),
+
+  shares: {
+    list: () =>
+      request<{ shares: Share[]; offline_available: boolean }>("/api/shares"),
+
+    create: (input: {
+      label?: string;
+      folder_id?: string;
+      permissions: SharePermissions;
+      password?: string;
+      expiry_hours?: number;
+      usage_limit?: number;
+      allow_offline?: boolean;
+    }) => request<Share>("/api/shares", { method: "POST", body: json(input) }),
+
+    revoke: (id: string) =>
+      request<{ ok: true }>(`/api/shares/${id}`, { method: "DELETE" }),
+
+    setOffline: (enabled: boolean, password?: string) =>
+      request<{ ok: true; enabled: boolean }>("/api/shares/offline", {
+        method: "POST",
+        body: json({ enabled, password }),
+      }),
+  },
+
+  /// The unauthenticated side, used only by the public share page.
+  publicShare: {
+    info: (token: string) =>
+      request<{
+        label: string | null;
+        permissions: SharePermissions;
+        needs_password: boolean;
+        unlocked: boolean;
+        available: boolean;
+      }>(`/api/s/${token}`),
+
+    verify: (token: string, password: string) =>
+      request<{ ok: true }>(`/api/s/${token}/verify`, {
+        method: "POST",
+        body: json({ password }),
+      }),
+
+    files: (token: string) =>
+      request<{ files: FileRow[] }>(`/api/s/${token}/files`),
+
+    downloadUrl: (token: string, id: number) =>
+      `/api/s/${token}/files/${id}/download`,
+  },
 
   folders: {
     list: () => request<{ folders: Folder[] }>("/api/folders"),
