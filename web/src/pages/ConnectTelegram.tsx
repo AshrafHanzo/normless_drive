@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowLeft,
   ExternalLink,
@@ -7,12 +7,14 @@ import {
   MessageSquare,
   Phone,
   ShieldAlert,
+  QrCode,
   Smartphone,
 } from "lucide-react";
 import { api, ApiError } from "../api";
+import { QRCodeSVG } from "qrcode.react";
 import { Alert, Button, Card, Field, PasswordField } from "../ui";
 
-type Step = "guide" | "credentials" | "phone" | "code" | "password" | "done";
+type Step = "guide" | "credentials" | "method" | "qr" | "phone" | "code" | "password" | "done";
 
 export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
   const [step, setStep] = useState<Step>("guide");
@@ -22,6 +24,7 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
   const [code, setCode] = useState("");
   const [twoFactor, setTwoFactor] = useState("");
   const [busy, setBusy] = useState(false);
+  const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fail = (caught: unknown) =>
@@ -42,6 +45,48 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
       setBusy(false);
     }
   }
+
+  /// Requests a QR token and moves to the QR screen.
+  const startQr = () =>
+    run(async () => {
+      setQrUrl(null);
+      setStep("qr");
+      const result = await api.telegram.qrStart(Number(apiId), apiHash);
+      setQrUrl(result.url);
+    });
+
+  /// Polls while the QR screen is up.
+  ///
+  /// Telegram's token lasts about a minute, so this also refreshes it when
+  /// the poll comes back with a new one — otherwise the code on screen
+  /// goes stale and scanning it does nothing, with no visible reason.
+  useEffect(() => {
+    if (step !== "qr") return;
+
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const result = await api.telegram.qrPoll();
+        if (cancelled) return;
+        if (result.connected) {
+          setStep("done");
+          onConnected();
+          return;
+        }
+        if (result.url) setQrUrl(result.url);
+      } catch (caught) {
+        if (cancelled) return;
+        fail(caught);
+        setStep("method");
+      }
+    };
+
+    const timer = window.setInterval(tick, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [step, onConnected]);
 
   const sendCode = () =>
     run(async () => {
@@ -80,13 +125,81 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
 
         {step === "guide" && <Guide onNext={() => setStep("credentials")} />}
 
+        {step === "method" && (
+          <div>
+            <Header
+              icon={Smartphone}
+              title="How would you like to sign in?"
+              subtitle="Both link the same account. The QR code is usually quicker and avoids waiting for a text."
+            />
+            <div className="space-y-2">
+              <MethodCard
+                icon={QrCode}
+                title="Scan a QR code"
+                detail="Open Telegram on your phone → Settings → Devices → Link Desktop Device. Nothing to type."
+                recommended
+                onClick={() => void startQr()}
+              />
+              <MethodCard
+                icon={Phone}
+                title="Use my phone number"
+                detail="Telegram sends a code to your account. Needs the country code."
+                onClick={() => setStep("phone")}
+              />
+            </div>
+            <Button
+              variant="ghost"
+              onClick={() => setStep("credentials")}
+              className="mt-4 w-full"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Back
+            </Button>
+          </div>
+        )}
+
+        {step === "qr" && (
+          <div className="text-center">
+            <Header
+              icon={QrCode}
+              title="Scan this with Telegram"
+              subtitle="On your phone: Settings → Devices → Link Desktop Device, then point the camera here."
+            />
+            {qrUrl ? (
+              <div className="mx-auto mb-4 w-fit rounded-[var(--radius-card)] bg-white p-4">
+                <QRCodeSVG value={qrUrl} size={200} level="M" />
+              </div>
+            ) : (
+              <div className="py-12">
+                <Loader2 className="mx-auto h-5 w-5 animate-spin text-ink-faint" />
+              </div>
+            )}
+            <p className="mb-4 text-xs text-ink-muted">
+              Waiting for the scan… this page updates by itself.
+            </p>
+            <div className="flex gap-2">
+              <Button
+                variant="ghost"
+                onClick={() => setStep("method")}
+                className="flex-1"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                Back
+              </Button>
+              <Button variant="ghost" onClick={() => void startQr()} className="flex-1">
+                New code
+              </Button>
+            </div>
+          </div>
+        )}
+
         {step === "credentials" && (
           <form
             className="space-y-4"
             onSubmit={(e) => {
               e.preventDefault();
               setError(null);
-              setStep("phone");
+              setStep("method");
             }}
           >
             <Header
@@ -280,6 +393,43 @@ function Header({
         <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">{subtitle}</p>
       </div>
     </div>
+  );
+}
+
+function MethodCard({
+  icon: Icon,
+  title,
+  detail,
+  recommended = false,
+  onClick,
+}: {
+  icon: typeof Phone;
+  title: string;
+  detail: string;
+  recommended?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex w-full gap-3 rounded-[var(--radius-control)] border border-border
+                 p-3 text-left transition-colors hover:border-accent/50 hover:bg-surface"
+    >
+      <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-[var(--radius-control)] bg-accent-soft">
+        <Icon className="h-4 w-4 text-accent" />
+      </div>
+      <div className="min-w-0">
+        <p className="flex items-center gap-2 text-sm font-medium text-ink">
+          {title}
+          {recommended && (
+            <span className="rounded-full bg-success-soft px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-success)]">
+              Easier
+            </span>
+          )}
+        </p>
+        <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">{detail}</p>
+      </div>
+    </button>
   );
 }
 

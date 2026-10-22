@@ -25,6 +25,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/telegram")
             .route("/status", web::get().to(status))
+            .route("/qr/start", web::post().to(qr_start))
+            .route("/qr/poll", web::post().to(qr_poll))
             .route("/start", web::post().to(start))
             .route("/code", web::post().to(code))
             .route("/password", web::post().to(password))
@@ -131,18 +133,7 @@ async fn start(
     let phone = normalize_phone(&body.phone).map_err(ApiError::BadRequest)?;
     let api_hash = body.api_hash.trim().to_string();
 
-    if body.api_id <= 0 {
-        return Err(ApiError::BadRequest(
-            "The API ID should be a positive number from my.telegram.org.".into(),
-        ));
-    }
-    // Telegram's hashes are 32 hex characters. Checking here turns a
-    // confusing connection failure into a pointer at the wrong field.
-    if api_hash.len() != 32 || !api_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(ApiError::BadRequest(
-            "The API hash should be 32 characters of hex from my.telegram.org.".into(),
-        ));
-    }
+    validate_credentials(body.api_id, &api_hash)?;
 
     // Replaces any earlier attempt, closing its connection.
     pending.remove(user.id).await;
@@ -166,6 +157,176 @@ async fn start(
     Ok(HttpResponse::Ok().json(StartResponse {
         sent: true,
         phone_hint: hint(&phone),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct QrStart {
+    pub api_id: i32,
+    pub api_hash: String,
+}
+
+#[derive(Serialize)]
+struct QrResponse {
+    /// `tg://login?token=…`, to be rendered as a QR code by the browser.
+    url: Option<String>,
+    expires: Option<i32>,
+    connected: bool,
+}
+
+/// Opens a connection and asks for a login token to display.
+async fn qr_start(
+    user: CurrentUser,
+    body: web::Json<QrStart>,
+    pending: web::Data<SharedPending>,
+) -> ApiResult<HttpResponse> {
+    let api_hash = body.api_hash.trim().to_string();
+    validate_credentials(body.api_id, &api_hash)?;
+
+    pending.remove(user.id).await;
+
+    let session = std::sync::Arc::new(grammers_session::storages::MemorySession::from(
+        grammers_session::SessionData::default(),
+    ));
+    let connection = super::Connection::open(session, body.api_id);
+
+    let state = match super::qr::export(&connection.client, body.api_id, &api_hash).await {
+        Ok(state) => state,
+        Err(error) => {
+            connection.close().await;
+            return Err(error.into());
+        }
+    };
+
+    let (url, expires) = match state {
+        super::qr::QrState::Waiting { token, expires } => {
+            (Some(super::qr::login_url(&token)), Some(expires))
+        }
+        // Neither can happen on the first call — nothing has been scanned
+        // yet — but answering honestly beats inventing a token.
+        super::qr::QrState::Authorized | super::qr::QrState::Migrate { .. } => (None, None),
+    };
+
+    pending
+        .insert(
+            user.id,
+            Pending {
+                connection,
+                stage: LoginStage::AwaitingQrScan,
+                api_id: body.api_id,
+                api_hash,
+                phone: String::new(),
+                started: std::time::Instant::now(),
+            },
+        )
+        .await;
+
+    Ok(HttpResponse::Ok().json(QrResponse {
+        url,
+        expires,
+        connected: false,
+    }))
+}
+
+/// Polls for a scan. The browser calls this every couple of seconds.
+async fn qr_poll(
+    request: HttpRequest,
+    user: CurrentUser,
+    pending: web::Data<SharedPending>,
+    pool: web::Data<Db>,
+    keys: web::Data<KeyCache>,
+) -> ApiResult<HttpResponse> {
+    let entry = pending.take(user.id).await.ok_or_else(|| {
+        ApiError::BadRequest("That sign-in expired. Show a new QR code.".into())
+    })?;
+
+    if !matches!(entry.stage, LoginStage::AwaitingQrScan) {
+        pending.insert(user.id, entry).await;
+        return Err(ApiError::BadRequest(
+            "This attempt is not a QR sign-in.".into(),
+        ));
+    }
+
+    let state = super::qr::export(&entry.connection.client, entry.api_id, &entry.api_hash).await;
+
+    let state = match state {
+        Ok(state) => state,
+        Err(error) => {
+            entry.connection.close().await;
+            return Err(error.into());
+        }
+    };
+
+    match state {
+        super::qr::QrState::Waiting { token, expires } => {
+            let url = super::qr::login_url(&token);
+            pending.insert(user.id, entry).await;
+            Ok(HttpResponse::Ok().json(QrResponse {
+                url: Some(url),
+                expires: Some(expires),
+                connected: false,
+            }))
+        }
+        super::qr::QrState::Migrate { dc_id, token } => {
+            // The account lives in another datacenter. grammers routes by
+            // datacenter internally, so importing the token on this same
+            // client is enough — it does not need a fresh connection.
+            tracing::info!(dc_id, "QR login migrating datacenter");
+            let imported = super::qr::import(&entry.connection.client, token).await;
+            match imported {
+                Ok(super::qr::QrState::Authorized) => {
+                    finish_qr(&request, &user, entry, &pool, &keys).await
+                }
+                Ok(_) => {
+                    pending.insert(user.id, entry).await;
+                    Ok(HttpResponse::Ok().json(QrResponse {
+                        url: None,
+                        expires: None,
+                        connected: false,
+                    }))
+                }
+                Err(error) => {
+                    entry.connection.close().await;
+                    Err(error.into())
+                }
+            }
+        }
+        super::qr::QrState::Authorized => finish_qr(&request, &user, entry, &pool, &keys).await,
+    }
+}
+
+/// Saves the session once a QR login has been accepted.
+async fn finish_qr(
+    request: &HttpRequest,
+    user: &CurrentUser,
+    entry: Pending,
+    pool: &Db,
+    keys: &KeyCache,
+) -> ApiResult<HttpResponse> {
+    let session = super::session_store::export(&entry.connection.session)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!("{error}")))?;
+
+    let stored = store_session(
+        request,
+        user,
+        entry.api_id,
+        &entry.api_hash,
+        // QR login never learns the phone number, so there is nothing to
+        // hint at. Saying "QR" is more honest than inventing digits.
+        "qr",
+        session,
+        pool,
+        keys,
+    )
+    .await;
+
+    entry.connection.close().await;
+    stored?;
+
+    Ok(HttpResponse::Ok().json(QrResponse {
+        url: None,
+        expires: None,
+        connected: true,
     }))
 }
 
@@ -411,14 +572,58 @@ fn hint(phone: &str) -> String {
     format!("...{tail}")
 }
 
+/// Catches a mistyped API ID or hash before a connection is attempted.
+///
+/// Both failures otherwise surface as an opaque connection error, which
+/// points at the network rather than at the field that is actually wrong.
+fn validate_credentials(api_id: i32, api_hash: &str) -> ApiResult<()> {
+    if api_id <= 0 {
+        return Err(ApiError::BadRequest(
+            "The API ID should be a positive number from my.telegram.org.".into(),
+        ));
+    }
+    // Telegram's hashes are exactly 32 hex characters.
+    if api_hash.len() != 32 || !api_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::BadRequest(
+            "The API hash should be 32 characters of hex from my.telegram.org.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Normalises a phone number to `+<digits>`.
+///
+/// Requires an explicit `+` or `00` prefix. The earlier version simply
+/// prefixed `+` to whatever digits it was given, which silently turned a
+/// local number like `7305041971` into `+7305041971` — a Russian prefix.
+/// Telegram accepts `sendCode` for that happily and reports success, so
+/// the only symptom was a code that never arrived, with nothing anywhere
+/// indicating why.
 fn normalize_phone(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
 
-    if digits.len() < 7 || digits.len() > 15 {
-        return Err("That does not look like a phone number. Include the country code.".into());
+    let explicit = trimmed.starts_with('+') || trimmed.replace(['(', ' ', '-'], "").starts_with("00");
+    if !explicit {
+        return Err(
+            "Start with your country code, like +91 7305041971. Without it we cannot tell \
+             which country the number belongs to, and the code would be sent to the wrong one."
+                .into(),
+        );
     }
-    // grammers wants it with the leading +.
+
+    let mut digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    // 00 is the international prefix in much of the world; Telegram wants
+    // the + form, and the two mean the same thing.
+    if !trimmed.starts_with('+') && digits.starts_with("00") {
+        digits = digits[2..].to_string();
+    }
+
+    // ITU E.164: a country code plus a subscriber number is at least 8
+    // digits in practice and never more than 15.
+    if digits.len() < 8 || digits.len() > 15 {
+        return Err("That does not look like a full phone number.".into());
+    }
+
     Ok(format!("+{digits}"))
 }
 
@@ -427,14 +632,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_phone_number_keeps_only_its_digits_and_gains_a_plus() {
-        assert_eq!(normalize_phone(" +91 98765 43210 ").unwrap(), "+919876543210");
-        assert_eq!(normalize_phone("(044) 1234-5678").unwrap(), "+04412345678");
+    fn a_number_with_an_explicit_country_code_is_normalised() {
+        assert_eq!(normalize_phone(" +91 73050 41971 ").unwrap(), "+917305041971");
+        assert_eq!(normalize_phone("+1 (555) 010-0123").unwrap(), "+15550100123");
+        // 00 is the same thing as + in most of the world.
+        assert_eq!(normalize_phone("0091 7305041971").unwrap(), "+917305041971");
+    }
+
+    #[test]
+    fn a_number_without_a_country_code_is_refused() {
+        // This is the bug that cost real debugging time: "7305041971" was
+        // being turned into "+7305041971", a Russian prefix. Telegram
+        // accepted it and reported success, and the code went nowhere the
+        // user could see.
+        let error = normalize_phone("7305041971").expect_err("must be refused");
+        assert!(error.contains("country code"), "got: {error}");
+
+        for bare in ["9876543210", "555 010 0123", "(044) 1234-5678"] {
+            assert!(normalize_phone(bare).is_err(), "should refuse {bare:?}");
+        }
     }
 
     #[test]
     fn an_implausible_phone_number_is_refused() {
-        for bad in ["", "123", "abc", &"9".repeat(16)] {
+        for bad in ["", "+123", "abc", "+", &format!("+{}", "9".repeat(16))] {
             assert!(normalize_phone(bad).is_err(), "should reject {bad:?}");
         }
     }

@@ -294,6 +294,18 @@ export const api = {
         unlocked: boolean;
       }>("/api/telegram/status"),
 
+    qrStart: (api_id: number, api_hash: string) =>
+      request<{ url: string | null; expires: number | null; connected: boolean }>(
+        "/api/telegram/qr/start",
+        { method: "POST", body: json({ api_id, api_hash }) },
+      ),
+
+    qrPoll: () =>
+      request<{ url: string | null; expires: number | null; connected: boolean }>(
+        "/api/telegram/qr/poll",
+        { method: "POST" },
+      ),
+
     start: (api_id: number, api_hash: string, phone: string) =>
       request<{ sent: boolean; phone_hint: string }>("/api/telegram/start", {
         method: "POST",

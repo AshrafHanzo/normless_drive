@@ -16,6 +16,7 @@ pub mod connect;
 pub mod files;
 pub mod folders;
 pub mod remote;
+pub mod qr;
 pub mod routes;
 pub mod session_store;
 
@@ -82,6 +83,8 @@ pub enum LoginStage {
     AwaitingCode(grammers_client::types::LoginToken),
     /// The code was right but the account has 2FA; waiting for the password.
     AwaitingPassword(Box<grammers_client::types::PasswordToken>),
+    /// A QR code is on screen; waiting for someone to scan it.
+    AwaitingQrScan,
 }
 
 pub struct Pending {
@@ -235,6 +238,11 @@ fn classify(error: &grammers_client::InvocationError) -> TelegramError {
         }
         _ => TelegramError::Other(text),
     }
+}
+
+/// `classify` for callers outside this module.
+pub fn classify_public(error: &grammers_client::InvocationError) -> TelegramError {
+    classify(error)
 }
 
 fn classify_sign_in(error: SignInError) -> TelegramError {
