@@ -1,19 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
-import { HardDrive, LogOut, Shield } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { api, ApiError, type User } from "./api";
+import { applyTheme, loadTheme, watchSystemTheme } from "./theme";
 import { Admin } from "./pages/Admin";
 import { ConnectTelegram } from "./pages/ConnectTelegram";
-import { Files } from "./pages/Files";
+import { Drive } from "./pages/Drive";
 import { PublicShare } from "./pages/PublicShare";
 import { SignIn } from "./pages/SignIn";
 import { Button, Spinner } from "./ui";
 
-type View = "drive" | "admin";
-
 export default function App() {
-  // A share link is a different application: no account, no header, and it
-  // must not try to resolve a session. Decided before anything else runs
-  // so opening one never flashes the sign-in screen.
+  // Applied before anything meaningful renders so a reload does not flash
+  // the wrong theme. index.html starts dark; this corrects it.
+  useEffect(() => {
+    applyTheme(loadTheme());
+    return watchSystemTheme(loadTheme);
+  }, []);
+
+  // A share link is a different application: no account, no chrome, and it
+  // must not try to resolve a session. Decided first so opening one never
+  // flashes the sign-in screen at a stranger.
   const shareToken = sharePathToken();
   if (shareToken) return <PublicShare token={shareToken} />;
 
@@ -26,13 +32,15 @@ function sharePathToken(): string | null {
   return match?.[1] ?? null;
 }
 
+type Screen = "drive" | "admin";
+
 function SignedInApp() {
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
-  const [view, setView] = useState<View>("drive");
+  const [screen, setScreen] = useState<Screen>("drive");
 
-  // Ask the server who we are on load. The session is an HttpOnly cookie, so
-  // this is the only way to know — there is nothing readable in JS to check.
+  // The session is an HttpOnly cookie, so asking the server is the only
+  // way to know who we are — there is nothing readable from JavaScript.
   useEffect(() => {
     let cancelled = false;
     api
@@ -41,7 +49,7 @@ function SignedInApp() {
         if (!cancelled) setUser(me);
       })
       .catch((caught) => {
-        // 401 just means "not signed in", which is the normal first visit.
+        // 401 just means "not signed in", the normal first visit.
         if (!(caught instanceof ApiError && caught.isAuthProblem)) {
           console.error("could not resolve session", caught);
         }
@@ -54,60 +62,48 @@ function SignedInApp() {
     };
   }, []);
 
+  const signOut = useCallback(async () => {
+    await api.logout().catch(() => undefined);
+    setUser(null);
+    setScreen("drive");
+  }, []);
+
   if (checking) return <Spinner />;
   if (!user) return <SignIn onSignedIn={setUser} />;
 
-  return (
-    <div className="min-h-full bg-canvas">
-      <header className="border-b border-border bg-surface">
-        <div className="mx-auto flex max-w-5xl items-center justify-between gap-4 px-4 py-3">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-7 w-7 items-center justify-center rounded-[var(--radius-control)] bg-accent">
-              <HardDrive className="h-4 w-4 text-white" />
-            </div>
-            <span className="text-sm font-semibold text-ink">
-              Normless Drive
-            </span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {user.role === "admin" && (
-              <Button
-                variant="ghost"
-                onClick={() => setView(view === "admin" ? "drive" : "admin")}
-              >
-                <Shield className="h-3.5 w-3.5" />
-                {view === "admin" ? "Back to drive" : "Admin"}
-              </Button>
-            )}
-            <span className="hidden text-xs text-ink-muted sm:inline">
-              {user.email}
-            </span>
-            <Button
-              variant="ghost"
-              onClick={async () => {
-                await api.logout().catch(() => undefined);
-                setUser(null);
-                setView("drive");
-              }}
-            >
-              <LogOut className="h-3.5 w-3.5" />
-            </Button>
-          </div>
+  if (screen === "admin" && user.role === "admin") {
+    return (
+      <div className="min-h-full bg-canvas">
+        <div className="mx-auto max-w-5xl px-4 pt-6">
+          <Button variant="ghost" onClick={() => setScreen("drive")}>
+            <ArrowLeft className="h-3.5 w-3.5" />
+            Back to drive
+          </Button>
         </div>
-      </header>
-
-      {view === "admin" && user.role === "admin" ? (
         <Admin me={user} />
-      ) : (
-        <Drive />
-      )}
-    </div>
+      </div>
+    );
+  }
+
+  return (
+    <TelegramGate
+      user={user}
+      onSignOut={signOut}
+      onOpenAdmin={() => setScreen("admin")}
+    />
   );
 }
 
 /// Shows the connect wizard until Telegram is linked, then the drive.
-function Drive() {
+function TelegramGate({
+  user,
+  onSignOut,
+  onOpenAdmin,
+}: {
+  user: User;
+  onSignOut: () => void;
+  onOpenAdmin: () => void;
+}) {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [hint, setHint] = useState<string | null>(null);
 
@@ -126,6 +122,13 @@ function Drive() {
   if (connected === null) return <Spinner />;
   if (!connected) return <ConnectTelegram onConnected={refresh} />;
 
-  return <Files phoneHint={hint} onDisconnected={refresh} />;
+  return (
+    <Drive
+      user={user}
+      phoneHint={hint}
+      onDisconnected={refresh}
+      onSignOut={onSignOut}
+      onOpenAdmin={onOpenAdmin}
+    />
+  );
 }
-

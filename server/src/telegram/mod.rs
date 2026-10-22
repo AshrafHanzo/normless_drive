@@ -15,6 +15,7 @@
 pub mod connect;
 pub mod files;
 pub mod folders;
+pub mod remote;
 pub mod routes;
 pub mod session_store;
 

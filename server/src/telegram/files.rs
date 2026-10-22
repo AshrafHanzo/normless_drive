@@ -197,7 +197,7 @@ async fn download(
         .content_type(mime)
         .insert_header((
             actix_web::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", sanitize(&name)),
+            format!("attachment; filename=\"{}\"", sanitize_name(&name)),
         ))
         .insert_header((actix_web::http::header::CONTENT_LENGTH, size.to_string()))
         .streaming(Box::pin(stream)))
@@ -229,7 +229,7 @@ async fn upload(
     let name = field
         .content_disposition()
         .and_then(|cd| cd.get_filename())
-        .map(sanitize)
+        .map(sanitize_name)
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "upload".to_string());
 
@@ -369,7 +369,7 @@ fn non_empty(value: &str, fallback: &str) -> String {
 /// It goes into a `Content-Disposition` header and is shown in the UI, so a
 /// name containing a quote or a newline could otherwise forge headers or
 /// escape the attribute.
-fn sanitize(name: &str) -> String {
+pub fn sanitize_name(name: &str) -> String {
     name.chars()
         .filter(|c| !matches!(c, '/' | '\\' | '"' | '\r' | '\n' | '\0'))
         .take(255)
@@ -380,22 +380,22 @@ fn sanitize(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize;
+    use super::sanitize_name;
 
     #[test]
     fn a_filename_cannot_escape_the_header_or_the_path() {
-        assert_eq!(sanitize("../../etc/passwd"), "....etcpasswd");
-        assert_eq!(sanitize("re\"port.pdf"), "report.pdf");
-        assert_eq!(sanitize("a\r\nX-Evil: yes"), "aX-Evil: yes");
+        assert_eq!(sanitize_name("../../etc/passwd"), "....etcpasswd");
+        assert_eq!(sanitize_name("re\"port.pdf"), "report.pdf");
+        assert_eq!(sanitize_name("a\r\nX-Evil: yes"), "aX-Evil: yes");
     }
 
     #[test]
     fn an_ordinary_filename_is_untouched() {
-        assert_eq!(sanitize("Quarterly Report 2026.pdf"), "Quarterly Report 2026.pdf");
+        assert_eq!(sanitize_name("Quarterly Report 2026.pdf"), "Quarterly Report 2026.pdf");
     }
 
     #[test]
     fn an_absurdly_long_name_is_truncated() {
-        assert_eq!(sanitize(&"a".repeat(400)).len(), 255);
+        assert_eq!(sanitize_name(&"a".repeat(400)).len(), 255);
     }
 }

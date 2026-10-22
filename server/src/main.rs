@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             .configure(telegram::routes::configure)
             .configure(telegram::files::configure)
             .configure(telegram::folders::configure)
+            .configure(telegram::remote::configure)
             .configure(shares::routes::configure)
             .configure(shares::public::configure)
             .configure(admin::configure)

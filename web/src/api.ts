@@ -232,6 +232,12 @@ export const api = {
         folder ? `/api/files?folder=${folder}` : "/api/files",
       ),
 
+    remote: (url: string, folder?: string, name?: string) =>
+      request<{ ok: true; name: string; size: number }>("/api/files/remote", {
+        method: "POST",
+        body: json({ url, folder, name }),
+      }),
+
     remove: (id: number, folder?: string) =>
       request<{ ok: true }>(
         folder ? `/api/files/${id}?folder=${folder}` : `/api/files/${id}`,

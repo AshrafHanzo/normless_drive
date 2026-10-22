@@ -17,6 +17,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 # Lets a download be written as a generator over Telegram chunks rather
 # than collected into memory first.
 async-stream = "0.3"
+# Remote upload: fetching a URL server-side and streaming it to Telegram.
+# rustls rather than native-tls so there is no OpenSSL build dependency.
+reqwest = { version = "0.12", default-features = false, features = [
+    "stream",
+    "rustls-tls",
+] }
 
 # Postgres via tokio-postgres rather than sqlx.
 #
