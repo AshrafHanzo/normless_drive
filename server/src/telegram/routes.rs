@@ -303,10 +303,13 @@ async fn qr_poll(
             }))
         }
         super::qr::QrState::Migrate { dc_id, token } => {
-            // The account lives in another datacenter. grammers routes by
-            // datacenter internally, so importing the token on this same
-            // client is enough — it does not need a fresh connection.
-            tracing::info!(dc_id, "QR login migrating datacenter");
+            // A MigrateTo reply means the scan SUCCEEDED and the account
+            // lives in another datacenter. The token it carries is only
+            // valid against that datacenter, so the connection has to move
+            // first — importing it here answers AUTH_TOKEN_EXPIRED, which
+            // reads as "the QR code timed out" when in fact it worked.
+            tracing::info!(dc_id, "QR scanned; moving to the account's datacenter");
+            entry.connection.migrate_to(dc_id);
             let imported = super::qr::import(&entry.connection.client, token).await;
             match imported {
                 Ok(super::qr::QrState::Authorized) => {
