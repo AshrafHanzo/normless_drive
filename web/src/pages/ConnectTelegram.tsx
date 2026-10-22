@@ -23,7 +23,6 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
   const [twoFactor, setTwoFactor] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [hint, setHint] = useState("");
 
   const fail = (caught: unknown) =>
     setError(
@@ -46,8 +45,7 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
 
   const sendCode = () =>
     run(async () => {
-      const result = await api.telegram.start(Number(apiId), apiHash, phone);
-      setHint(result.phone_hint);
+      await api.telegram.start(Number(apiId), apiHash, phone);
       setStep("code");
     });
 
@@ -174,8 +172,22 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
             <Header
               icon={MessageSquare}
               title="Enter the code"
-              subtitle={`Telegram sent a code to ${hint}. It arrives in the Telegram app itself, not by SMS, if you are signed in elsewhere.`}
+              // The full number, not the masked hint: a mistyped digit is
+              // by far the most common reason no code arrives, and a
+              // masked version hides exactly the mistake worth spotting.
+              subtitle={`Telegram sent a code to ${phone}.`}
             />
+
+            <div className="rounded-[var(--radius-control)] border border-border bg-surface p-3">
+              <p className="text-xs leading-relaxed text-ink-muted">
+                <strong className="text-ink">Where to look.</strong> If you are
+                signed in to Telegram anywhere else — phone, desktop, web — the
+                code arrives there as a message from{" "}
+                <strong className="text-ink">Telegram</strong> (the official
+                account with a blue tick), not as an SMS. Check that chat first.
+              </p>
+            </div>
+
             <Field
               label="Login code"
               inputMode="numeric"
@@ -185,15 +197,25 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
               onChange={(e) => setCode(e.target.value)}
               placeholder="12345"
             />
+
             <div className="flex gap-2">
               <Button variant="ghost" type="button" onClick={() => setStep("phone")}>
                 <ArrowLeft className="h-3.5 w-3.5" />
-                Start over
+                Change number
               </Button>
               <Button type="submit" busy={busy} className="flex-1">
                 Verify
               </Button>
             </div>
+
+            <button
+              type="button"
+              onClick={() => void sendCode()}
+              disabled={busy}
+              className="w-full text-center text-xs text-accent hover:underline disabled:opacity-50"
+            >
+              Did not arrive? Send another code
+            </button>
           </form>
         )}
 
