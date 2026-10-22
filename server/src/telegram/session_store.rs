@@ -1,7 +1,7 @@
 ﻿//! Turning a live grammers session into bytes we can encrypt, and back.
 //!
 //! grammers ships two `Session` implementations: one in memory, one backed
-//! by a SQLite file. Neither suits a multi-user server â€” a file would mean
+//! by a SQLite file. Neither suits a multi-user server — a file would mean
 //! every user's plaintext session sitting on disk, which is precisely what
 //! the encryption exists to avoid.
 //!
@@ -23,7 +23,7 @@ use grammers_session::{Session, SessionData};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the shape below changes incompatibly. A stored session
-/// from an older version is discarded rather than misread â€” the cost is one
+/// from an older version is discarded rather than misread — the cost is one
 /// re-login, against silently corrupt session state.
 const FORMAT_VERSION: u16 = 1;
 
@@ -47,7 +47,7 @@ pub enum StoreError {
 /// A `Session` that borrows another through an `Arc`.
 ///
 /// `SessionData: From<S: Session>` takes the session *by value*, and the
-/// trait is implemented only for the two concrete storages â€” not for
+/// trait is implemented only for the two concrete storages — not for
 /// references or `Arc`. But the live session must stay owned by the sender
 /// pool while we snapshot it. Every method takes `&self`, so delegating
 /// through a clone of the `Arc` gives `From` something it can consume
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn a_fresh_session_round_trips() {
-        // Not a signed-in session â€” that needs the network â€” but it does
+        // Not a signed-in session — that needs the network — but it does
         // prove the serialise/deserialise path and the known datacenter
         // options survive intact, which is where the format breaks first.
         let session = Arc::new(MemorySession::from(SessionData::default()));

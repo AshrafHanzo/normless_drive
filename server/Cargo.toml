@@ -8,6 +8,11 @@ description = "Browser front end for Telegram-backed storage, with accounts and 
 actix-web = "4"
 actix-cors = "0.7"
 actix-files = "0.6"
+actix-multipart = "0.7"
+futures = "0.3"
+# Lets a download be written as a generator over Telegram chunks rather
+# than collected into memory first.
+async-stream = "0.3"
 
 # Postgres via tokio-postgres rather than sqlx.
 #

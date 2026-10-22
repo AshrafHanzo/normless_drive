@@ -20,6 +20,15 @@ export interface AdminUserRow extends User {
   telegram_connected: boolean;
 }
 
+export interface FileRow {
+  id: number;
+  name: string;
+  size: number;
+  mime_type: string | null;
+  /// Unix seconds, as Telegram reports it.
+  date: number;
+}
+
 export interface AuditEntry {
   id: number;
   user_id: string | null;
@@ -120,6 +129,33 @@ export const api = {
   logout: () => request<{ ok: true }>("/api/auth/logout", { method: "POST" }),
 
   me: () => request<User>("/api/auth/me"),
+
+  files: {
+    list: () => request<{ files: FileRow[] }>("/api/files"),
+
+    upload: async (file: File) => {
+      const form = new FormData();
+      form.append("file", file);
+      // No Content-Type header: the browser must set it so the multipart
+      // boundary is included, and overriding it breaks the upload.
+      const response = await fetch("/api/files", {
+        method: "POST",
+        credentials: "same-origin",
+        body: form,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        const detail = (body as { error?: { code?: string; message?: string } })
+          ?.error;
+        throw new ApiError(
+          response.status,
+          detail?.code ?? "UNKNOWN",
+          detail?.message ?? `Upload failed with ${response.status}.`,
+        );
+      }
+      return response.json() as Promise<{ ok: true; name: string; size: number }>;
+    },
+  },
 
   telegram: {
     status: () =>

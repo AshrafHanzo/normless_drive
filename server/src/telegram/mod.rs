@@ -6,12 +6,14 @@
 //! grammers that client is backed by a `SenderPool` whose runner must stay
 //! spawned for the connection to live. So a half-finished login keeps its
 //! client, its pool task and its session alive in memory between HTTP
-//! requests â€” that is what `PendingLogins` holds.
+//! requests — that is what `PendingLogins` holds.
 //!
 //! On success the session is exported (see `session_store`), encrypted with
 //! the user's wrapping key, and written to Postgres. Plaintext never
 //! reaches disk.
 
+pub mod connect;
+pub mod files;
 pub mod routes;
 pub mod session_store;
 
@@ -174,6 +176,12 @@ pub enum TelegramError {
     FloodWait(u32),
     #[error("Could not save the Telegram session.")]
     Session,
+    #[error("No Telegram account is connected yet.")]
+    NotConnected,
+    /// The stored session exists but its key is not in memory — the server
+    /// restarted, or the login went idle. Signing in again restores it.
+    #[error("Please sign in again to unlock your Telegram connection.")]
+    Locked,
     #[error("Telegram said: {0}")]
     Other(String),
 }

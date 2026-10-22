@@ -3,8 +3,9 @@ import { HardDrive, LogOut, Shield } from "lucide-react";
 import { api, ApiError, type User } from "./api";
 import { Admin } from "./pages/Admin";
 import { ConnectTelegram } from "./pages/ConnectTelegram";
+import { Files } from "./pages/Files";
 import { SignIn } from "./pages/SignIn";
-import { Button, Card, Spinner } from "./ui";
+import { Button, Spinner } from "./ui";
 
 type View = "drive" | "admin";
 
@@ -14,7 +15,7 @@ export default function App() {
   const [view, setView] = useState<View>("drive");
 
   // Ask the server who we are on load. The session is an HttpOnly cookie, so
-  // this is the only way to know â€” there is nothing readable in JS to check.
+  // this is the only way to know — there is nothing readable in JS to check.
   useEffect(() => {
     let cancelled = false;
     api
@@ -108,25 +109,6 @@ function Drive() {
   if (connected === null) return <Spinner />;
   if (!connected) return <ConnectTelegram onConnected={refresh} />;
 
-  return (
-    <div className="mx-auto max-w-5xl px-4 py-12">
-      <Card className="px-6 py-12 text-center">
-        <h2 className="text-base font-semibold text-ink">Telegram connected</h2>
-        <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-ink-muted">
-          Linked to the account ending {hint ?? "â€”"}. Browsing and uploading
-          files is the next piece of work.
-        </p>
-        <Button
-          variant="ghost"
-          className="mx-auto mt-5"
-          onClick={async () => {
-            await api.telegram.disconnect().catch(() => undefined);
-            refresh();
-          }}
-        >
-          Disconnect Telegram
-        </Button>
-      </Card>
-    </div>
-  );
+  return <Files phoneHint={hint} onDisconnected={refresh} />;
 }
+

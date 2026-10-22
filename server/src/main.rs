@@ -1,4 +1,4 @@
-﻿//! Normless Drive â€” browser front end for Telegram-backed storage.
+//! Normless Drive — browser front end for Telegram-backed storage.
 //!
 //! See docs/ARCHITECTURE.md. In particular section 2 explains why Telegram
 //! sessions are encrypted with a key derived from each user's password, and
@@ -47,10 +47,11 @@ async fn main() -> anyhow::Result<()> {
     let shared_pool = web::Data::new(pool);
     let shared_keys = web::Data::new(keycache::KeyCache::new());
     let shared_pending = web::Data::new(std::sync::Arc::new(telegram::PendingLogins::new()));
+    let shared_clients = web::Data::new(std::sync::Arc::new(telegram::connect::Clients::new()));
 
     // Idle keys would otherwise sit in memory until their cookie expired,
     // two weeks later. Hourly is far more often than needed and costs
-    // nothing â€” the map holds one entry per signed-in session.
+    // nothing — the map holds one entry per signed-in session.
     let sweeper = shared_keys.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -69,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(shared_config.clone())
             .app_data(shared_keys.clone())
             .app_data(shared_pending.clone())
+            .app_data(shared_clients.clone())
             // Reject oversized JSON bodies early. File uploads do not come
             // through this extractor -- they stream -- so a small cap here
             // costs nothing and stops a trivial memory-exhaustion attempt.
@@ -77,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
             .route("/health", web::get().to(health))
             .configure(auth::routes::configure)
             .configure(telegram::routes::configure)
+            .configure(telegram::files::configure)
             .configure(admin::configure)
     })
     .bind(&bind_addr)?
@@ -96,7 +99,7 @@ async fn health() -> HttpResponse {
 /// Creates the administrator account from the environment, once.
 ///
 /// Only ever inserts. If the address already exists this does nothing and
-/// says so â€” a password left in the environment must not quietly reset the
+/// says so — a password left in the environment must not quietly reset the
 /// account on every restart, which would undo any password change made
 /// afterwards and would mean the plaintext in `.env` stays live forever.
 async fn seed_bootstrap_admin(pool: &db::Db, config: &Config) -> anyhow::Result<()> {
@@ -124,7 +127,7 @@ async fn seed_bootstrap_admin(pool: &db::Db, config: &Config) -> anyhow::Result<
         let role: String = row.get("role");
         let status: String = row.get("status");
 
-        // The account is already there. Make sure it is usable â€” an admin
+        // The account is already there. Make sure it is usable — an admin
         // who suspended themselves by accident, or who existed as a normal
         // user before being named in the environment, should be repaired
         // rather than left locked out. The password is untouched.

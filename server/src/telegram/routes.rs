@@ -50,7 +50,7 @@ impl From<TelegramError> for ApiError {
 ///
 /// Absent means the server restarted, or the session went idle, since they
 /// signed in. Nothing encrypted can be read or written until they sign in
-/// again â€” and saying so plainly beats a decryption error.
+/// again — and saying so plainly beats a decryption error.
 fn wrapping_key(
     request: &HttpRequest,
     keys: &KeyCache,
@@ -283,7 +283,7 @@ async fn password(
     // Destructured rather than rebuilt: `check_password` consumes the token
     // and nothing afterwards needs a stage, so there is no dummy value to
     // invent. A wrong password therefore ends this attempt and the user
-    // restarts from the phone number â€” Telegram's own clients do the same.
+    // restarts from the phone number — Telegram's own clients do the same.
     let Pending {
         connection,
         stage,
@@ -396,13 +396,19 @@ async fn store_session(
     Ok(())
 }
 
-/// Keeps only enough of the number to be recognisable: `+91 â€¢â€¢â€¢â€¢â€¢ â€¢â€¢123`.
-/// Stored rather than the full number â€” the drive has no use for it and a
+/// Keeps only enough of the number to be recognisable: `...506`.
+///
+/// Stored rather than the full number — the drive has no use for it and a
 /// phone number is personal data worth not keeping.
+///
+/// Deliberately ASCII. This string is written to the database and rendered
+/// in the browser, and a decorative bullet bought nothing while giving
+/// every tool in the chain a chance to mangle the encoding — which is
+/// exactly what happened.
 fn hint(phone: &str) -> String {
     let digits: Vec<char> = phone.chars().filter(|c| c.is_ascii_digit()).collect();
     let tail: String = digits.iter().rev().take(3).rev().collect();
-    format!("â€¢â€¢â€¢â€¢â€¢{tail}")
+    format!("...{tail}")
 }
 
 fn normalize_phone(raw: &str) -> Result<String, String> {
@@ -437,7 +443,15 @@ mod tests {
     fn the_stored_hint_reveals_only_the_last_three_digits() {
         // Enough for the owner to recognise which number they used, not
         // enough to be worth stealing.
-        assert_eq!(hint("+919876543210"), "â€¢â€¢â€¢â€¢â€¢210");
-        assert_eq!(hint("+1 555 0100"), "â€¢â€¢â€¢â€¢â€¢100");
+        assert_eq!(hint("+919876543210"), "...210");
+        assert_eq!(hint("+1 555 0100"), "...100");
+    }
+
+    #[test]
+    fn the_hint_is_pure_ascii() {
+        // It crosses Rust, Postgres, JSON and the browser. Every non-ASCII
+        // character in that chain is a chance for one of them to mangle it,
+        // and one already did.
+        assert!(hint("+919876543210").is_ascii());
     }
 }
