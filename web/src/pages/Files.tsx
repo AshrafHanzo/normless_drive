@@ -7,6 +7,7 @@ import {
   FileText,
   FileVideo,
   FolderPlus,
+  Share2,
   File as FileIcon,
   RotateCw,
   Unplug,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 import { api, ApiError, type FileRow, type Folder } from "../api";
 import { Alert, Button, Card, Spinner } from "../ui";
+import { ShareDialog } from "./ShareDialog";
 
 export function Files({
   phoneHint,
@@ -31,6 +33,7 @@ export function Files({
   const [progress, setProgress] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
+  const [sharing, setSharing] = useState(false);
 
   const load = useCallback(async (which?: string) => {
     setError(null);
@@ -127,6 +130,10 @@ export function Files({
         </div>
 
         <div className="flex gap-2">
+          <Button variant="ghost" onClick={() => setSharing(true)}>
+            <Share2 className="h-3.5 w-3.5" />
+            Share
+          </Button>
           <Button variant="ghost" busy={creating} onClick={() => void addFolder()}>
             <FolderPlus className="h-3.5 w-3.5" />
             New folder
@@ -168,6 +175,15 @@ export function Files({
           />
         ))}
       </div>
+
+      {sharing && (
+        <ShareDialog
+          folderId={folder}
+          folderName={activeName}
+          onClose={() => setSharing(false)}
+        />
+      )}
+
 
       {error && (
         <div className="mb-4">
