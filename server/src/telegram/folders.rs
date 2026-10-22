@@ -33,7 +33,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api/folders")
             .route("", web::get().to(list))
-            .route("", web::post().to(create)),
+            .route("", web::post().to(create))
+            .route("/sync", web::post().to(sync)),
     );
 }
 
@@ -120,6 +121,78 @@ async fn create(
         name: name.to_string(),
         created_at: row.get("created_at"),
     }))
+}
+
+/// Finds drive folders that exist in Telegram but not in this database.
+///
+/// The desktop app creates the same `<name> [TD]` channels, so somebody
+/// who has used both ends up with folders this server has never heard of.
+/// Without this they are invisible here, which looks like data loss even
+/// though nothing is lost — and that is the single most alarming thing a
+/// drive can do.
+///
+/// Also repairs access hashes, which are issued per account and can change
+/// if the user reconnects with different credentials.
+async fn sync(
+    request: HttpRequest,
+    user: CurrentUser,
+    keys: web::Data<KeyCache>,
+    clients: web::Data<SharedClients>,
+    pool: web::Data<Db>,
+) -> ApiResult<HttpResponse> {
+    let connection = super::files::connection_for(&request, &user, &keys, &clients, &pool).await?;
+
+    let mut dialogs = connection.client.iter_dialogs();
+    let mut found = Vec::new();
+
+    while let Some(dialog) = dialogs
+        .next()
+        .await
+        .map_err(|error| TelegramError::Other(format!("could not list chats: {error}")))?
+    {
+        let Peer::Channel(channel) = dialog.peer() else {
+            continue;
+        };
+        // Only channels this family of apps created. Matching on the title
+        // suffix rather than the description because a title comes free
+        // with the dialog list; reading each channel's "about" would be a
+        // request per chat.
+        let Some(name) = channel.title().strip_suffix(FOLDER_SUFFIX) else {
+            continue;
+        };
+        // A channel with no access hash cannot be addressed later, so
+        // recording it would produce a folder that fails on first open.
+        let Some(access_hash) = channel.raw.access_hash else {
+            continue;
+        };
+        found.push((channel.raw.id, name.to_string(), access_hash));
+    }
+
+    let client = pool.get().await?;
+    let mut added = 0usize;
+    for (channel_id, name, access_hash) in &found {
+        let row = client
+            .query_one(
+                "INSERT INTO folders (user_id, channel_id, name, access_hash, display_order)
+                 VALUES ($1, $2, $3, $4,
+                         COALESCE((SELECT max(display_order) + 1 FROM folders WHERE user_id = $1), 0))
+                 ON CONFLICT (user_id, channel_id) DO UPDATE
+                    SET name = EXCLUDED.name, access_hash = EXCLUDED.access_hash
+                 RETURNING (xmax = 0) AS inserted",
+                &[&user.id, channel_id, name, access_hash],
+            )
+            .await?;
+        if row.get::<_, bool>("inserted") {
+            added += 1;
+        }
+    }
+
+    tracing::info!(user = %user.id, seen = found.len(), added, "folder sync");
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "seen": found.len(),
+        "added": added,
+    })))
 }
 
 /// Creates a private broadcast channel and returns its id and access hash.

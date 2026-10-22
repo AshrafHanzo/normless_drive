@@ -15,6 +15,7 @@ import {
   List,
   LogOut,
   RotateCw,
+  RefreshCcw,
   Search,
   Settings,
   Share2,
@@ -33,6 +34,7 @@ import {
 import { Alert, Button, Spinner } from "../ui";
 import { Preferences } from "./Preferences";
 import { RemoteUpload } from "./RemoteUpload";
+import { NewFolder } from "./NewFolder";
 import { ShareDialog } from "./ShareDialog";
 
 type View = "list" | "grid";
@@ -63,6 +65,8 @@ export function Drive({
   const [prefs, setPrefs] = useState(false);
   const [remote, setRemote] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [newFolder, setNewFolder] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
 
@@ -118,17 +122,24 @@ export function Drive({
     }
   }
 
-  async function addFolder() {
-    const name = window.prompt("Folder name");
-    if (!name?.trim()) return;
+  /// Pulls in folders that exist in Telegram but not here — the ones made
+  /// by the desktop app, which uses the same channel naming.
+  async function syncFolders() {
+    setSyncing(true);
+    setError(null);
     try {
-      const made = await api.folders.create(name.trim());
+      const result = await api.folders.sync();
       await loadFolders();
-      setFolder(made.id);
-    } catch (caught) {
-      setError(
-        caught instanceof ApiError ? caught.message : "Could not create the folder.",
+      setProgress(
+        result.added > 0
+          ? `Found ${result.added} folder${result.added === 1 ? "" : "s"} from Telegram.`
+          : "No new folders — everything is already here.",
       );
+      window.setTimeout(() => setProgress(null), 4000);
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "Sync failed.");
+    } finally {
+      setSyncing(false);
     }
   }
 
@@ -214,9 +225,23 @@ export function Drive({
         </nav>
 
         <div className="border-t border-border p-3">
-          <Button variant="ghost" onClick={() => void addFolder()} className="w-full">
+          <Button
+            variant="ghost"
+            onClick={() => setNewFolder(true)}
+            className="w-full"
+          >
             <FolderPlus className="h-3.5 w-3.5" />
             Create folder
+          </Button>
+          <Button
+            variant="ghost"
+            busy={syncing}
+            onClick={() => void syncFolders()}
+            className="mt-1.5 w-full"
+            title="Find folders created in the desktop app"
+          >
+            <RefreshCcw className="h-3.5 w-3.5" />
+            Sync from Telegram
           </Button>
 
           <div className="mt-3 flex items-center gap-1.5 px-1">
@@ -368,6 +393,16 @@ export function Drive({
         />
       )}
       {prefs && <Preferences phoneHint={phoneHint} onClose={() => setPrefs(false)} />}
+      {newFolder && (
+        <NewFolder
+          onClose={() => setNewFolder(false)}
+          onCreated={(id) => {
+            setNewFolder(false);
+            void loadFolders();
+            setFolder(id);
+          }}
+        />
+      )}
       {remote && (
         <RemoteUpload
           folder={folder}

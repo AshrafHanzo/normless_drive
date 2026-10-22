@@ -219,6 +219,11 @@ export const api = {
 
   folders: {
     list: () => request<{ folders: Folder[] }>("/api/folders"),
+    sync: () =>
+      request<{ seen: number; added: number }>("/api/folders/sync", {
+        method: "POST",
+      }),
+
     create: (name: string) =>
       request<Folder>("/api/folders", {
         method: "POST",
