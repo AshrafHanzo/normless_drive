@@ -307,10 +307,16 @@ export const api = {
       ),
 
     start: (api_id: number, api_hash: string, phone: string) =>
-      request<{ sent: boolean; phone_hint: string; delivery: string; numeric: boolean }>("/api/telegram/start", {
+      request<{ sent: boolean; phone_hint: string; delivery: string; numeric: boolean; next: string | null }>("/api/telegram/start", {
         method: "POST",
         body: json({ api_id, api_hash, phone }),
       }),
+
+    resend: () =>
+      request<{ delivery: string; numeric: boolean; next: string | null }>(
+        "/api/telegram/resend",
+        { method: "POST" },
+      ),
 
     code: (code: string) =>
       request<{ connected: boolean; needs_password: boolean }>(

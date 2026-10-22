@@ -121,6 +121,41 @@ fn classify_delivery(kind: &tl::enums::auth::SentCodeType) -> Delivery {
 pub struct SentCode {
     pub phone_code_hash: String,
     pub delivery: Delivery,
+    /// What Telegram would switch to if asked to resend, if anything.
+    ///
+    /// This is how an SMS is obtained when Telegram's first choice was to
+    /// push the code into the app: there is no way to demand SMS up
+    /// front, only to ask for the next method after the first.
+    pub next: Option<NextMethod>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextMethod {
+    Sms,
+    Call,
+    MissedCall,
+    Other,
+}
+
+impl NextMethod {
+    pub fn describe(self) -> &'static str {
+        match self {
+            NextMethod::Sms => "Send it by SMS instead",
+            NextMethod::Call => "Call me with the code instead",
+            NextMethod::MissedCall => "Send a missed call instead",
+            NextMethod::Other => "Try another way",
+        }
+    }
+}
+
+fn classify_next(kind: &tl::enums::auth::CodeType) -> NextMethod {
+    use tl::enums::auth::CodeType as C;
+    match kind {
+        C::Sms => NextMethod::Sms,
+        C::Call => NextMethod::Call,
+        C::MissedCall => NextMethod::MissedCall,
+        _ => NextMethod::Other,
+    }
 }
 
 fn request(api_id: i32, api_hash: &str, phone: &str) -> tl::functions::auth::SendCode {
@@ -189,10 +224,12 @@ pub async fn send_code(
     match result {
         tl::enums::auth::SentCode::Code(code) => {
             let delivery = classify_delivery(&code.r#type);
-            tracing::info!(?delivery, "telegram chose a code delivery method");
+            let next = code.next_type.as_ref().map(classify_next);
+            tracing::info!(?delivery, ?next, "telegram chose a code delivery method");
             Ok(SentCode {
                 phone_code_hash: code.phone_code_hash,
                 delivery,
+                next,
             })
         }
         // The account was authorised without a code at all. Rare, but it
@@ -202,6 +239,45 @@ pub async fn send_code(
         )),
         tl::enums::auth::SentCode::PaymentRequired(_) => Err(TelegramError::Other(
             "Telegram is asking for payment to send a code to this number.".into(),
+        )),
+    }
+}
+
+/// Asks Telegram to send the code again by its next method.
+///
+/// When Telegram pushes a code into the app, someone not signed in
+/// anywhere else never sees it — and there is no way to ask for SMS up
+/// front. This is the only route to one.
+pub async fn resend(
+    client: &Client,
+    phone: &str,
+    phone_code_hash: &str,
+) -> Result<SentCode, TelegramError> {
+    let result = client
+        .invoke(&tl::functions::auth::ResendCode {
+            phone_number: phone.to_string(),
+            phone_code_hash: phone_code_hash.to_string(),
+            reason: None,
+        })
+        .await
+        .map_err(|error| super::classify_public(&error))?;
+
+    match result {
+        tl::enums::auth::SentCode::Code(code) => {
+            let delivery = classify_delivery(&code.r#type);
+            let next = code.next_type.as_ref().map(classify_next);
+            tracing::info!(?delivery, ?next, "telegram resent the code");
+            Ok(SentCode {
+                // Telegram may issue a new hash on resend; using the old
+                // one afterwards fails with PHONE_CODE_INVALID, which
+                // looks to the user like they mistyped.
+                phone_code_hash: code.phone_code_hash,
+                delivery,
+                next,
+            })
+        }
+        _ => Err(TelegramError::Other(
+            "Telegram could not resend the code.".into(),
         )),
     }
 }

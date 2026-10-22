@@ -29,6 +29,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/qr/poll", web::post().to(qr_poll))
             .route("/start", web::post().to(start))
             .route("/code", web::post().to(code))
+            .route("/resend", web::post().to(resend))
             .route("/password", web::post().to(password))
             .route("/disconnect", web::post().to(disconnect)),
     );
@@ -128,6 +129,8 @@ struct StartResponse {
     /// False when the code is a word or phrase rather than digits, so the
     /// input must not filter to numbers.
     numeric: bool,
+    /// What a resend would switch to, if Telegram offers an alternative.
+    next: Option<String>,
 }
 
 async fn start(
@@ -188,6 +191,7 @@ async fn start(
         phone_hint: hint(&phone),
         delivery: delivery.describe(),
         numeric: delivery.numeric(),
+        next: sent.next.map(|m| m.describe().to_string()),
     }))
 }
 
@@ -492,6 +496,74 @@ async fn code(
             Err(error.into())
         }
     }
+}
+
+/// Asks Telegram for the code again, by whatever method it offers next.
+///
+/// Usually the way to get an SMS: Telegram's first choice is to push the
+/// code into the app, which is no use to someone who is not already
+/// signed in on another device.
+async fn resend(
+    user: CurrentUser,
+    pending: web::Data<SharedPending>,
+) -> ApiResult<HttpResponse> {
+    let entry = pending.take(user.id).await.ok_or_else(|| {
+        ApiError::BadRequest("That attempt expired. Start again from your phone number.".into())
+    })?;
+
+    let LoginStage::AwaitingCode {
+        ref phone_code_hash,
+        ..
+    } = entry.stage
+    else {
+        pending.insert(user.id, entry).await;
+        return Err(ApiError::BadRequest(
+            "There is no code to resend right now.".into(),
+        ));
+    };
+
+    let sent =
+        match super::phone::resend(&entry.connection.client, &entry.phone, phone_code_hash).await {
+            Ok(sent) => sent,
+            Err(error) => {
+                entry.connection.close().await;
+                return Err(error.into());
+            }
+        };
+
+    let delivery = sent.delivery.clone();
+    let next = sent.next;
+
+    pending
+        .insert(
+            user.id,
+            Pending {
+                stage: LoginStage::AwaitingCode {
+                    // Telegram can issue a new hash on resend. Keeping the
+                    // old one would fail the next submission as an invalid
+                    // code, which reads as the user mistyping.
+                    phone_code_hash: sent.phone_code_hash,
+                    delivery: delivery.clone(),
+                },
+                ..entry
+            },
+        )
+        .await;
+
+    Ok(HttpResponse::Ok().json(StartResponse {
+        sent: true,
+        phone_hint: hint(&entry_phone_placeholder()),
+        delivery: delivery.describe(),
+        numeric: delivery.numeric(),
+        next: next.map(|method| method.describe().to_string()),
+    }))
+}
+
+/// The hint is not meaningful on a resend — the number has not changed —
+/// but the response shape is shared, so this keeps it honest rather than
+/// echoing a stale value.
+fn entry_phone_placeholder() -> String {
+    String::new()
 }
 
 #[derive(Deserialize)]

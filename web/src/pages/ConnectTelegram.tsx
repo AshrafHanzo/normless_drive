@@ -26,6 +26,7 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
   const [busy, setBusy] = useState(false);
   const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [delivery, setDelivery] = useState<string>("");
+  const [nextMethod, setNextMethod] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const fail = (caught: unknown) =>
@@ -89,10 +90,19 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
     };
   }, [step, onConnected]);
 
+  /// Asks Telegram to try its next delivery method, usually SMS.
+  const resendCode = () =>
+    run(async () => {
+      const again = await api.telegram.resend();
+      setDelivery(again.delivery);
+      setNextMethod(again.next);
+    });
+
   const sendCode = () =>
     run(async () => {
       const sent = await api.telegram.start(Number(apiId), apiHash, phone);
       setDelivery(sent.delivery);
+      setNextMethod(sent.next);
       setStep("code");
     });
 
@@ -323,14 +333,31 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
               </Button>
             </div>
 
-            <button
-              type="button"
-              onClick={() => void sendCode()}
-              disabled={busy}
-              className="w-full text-center text-xs text-accent hover:underline disabled:opacity-50"
-            >
-              Did not arrive? Send another code
-            </button>
+            {/* Telegram's first choice is to push the code into the app,
+                which is no use to someone not already signed in on another
+                device. There is no way to request SMS up front — only to
+                ask for the next method after the first. */}
+            <div className="space-y-1.5 border-t border-border-soft pt-3">
+              {nextMethod && (
+                <button
+                  type="button"
+                  onClick={() => void resendCode()}
+                  disabled={busy}
+                  className="w-full rounded-[var(--radius-control)] border border-accent/40
+                             bg-accent-soft py-2 text-xs font-medium text-accent
+                             transition-colors hover:bg-accent-soft/70 disabled:opacity-50"
+                >
+                  {nextMethod}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setStep("method")}
+                className="w-full text-center text-xs text-ink-muted hover:text-ink"
+              >
+                Still nothing? Use the QR code instead — it always works
+              </button>
+            </div>
           </form>
         )}
 
