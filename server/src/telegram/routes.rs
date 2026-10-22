@@ -123,6 +123,11 @@ pub struct StartRequest {
 struct StartResponse {
     sent: bool,
     phone_hint: String,
+    /// Where Telegram actually sent it, in words for the user.
+    delivery: String,
+    /// False when the code is a word or phrase rather than digits, so the
+    /// input must not filter to numbers.
+    numeric: bool,
 }
 
 async fn start(
@@ -138,14 +143,38 @@ async fn start(
     // Replaces any earlier attempt, closing its connection.
     pending.remove(user.id).await;
 
-    let (connection, token) = request_code(body.api_id, &api_hash, &phone).await?;
+    let session = std::sync::Arc::new(grammers_session::storages::MemorySession::from(
+        grammers_session::SessionData::default(),
+    ));
+    let connection = super::Connection::open(session, body.api_id);
 
+    let sent = match super::phone::send_code(&connection.client, body.api_id, &api_hash, &phone)
+        .await
+    {
+        Ok(sent) => sent,
+        Err(error) => {
+            connection.close().await;
+            return Err(error.into());
+        }
+    };
+
+    // Telegram picked a method this app cannot finish. Saying so now beats
+    // leaving someone watching an inbox for a code that will never come.
+    if !sent.delivery.usable() {
+        connection.close().await;
+        return Err(ApiError::BadRequest(sent.delivery.describe()));
+    }
+
+    let delivery = sent.delivery.clone();
     pending
         .insert(
             user.id,
             Pending {
                 connection,
-                stage: LoginStage::AwaitingCode(token),
+                stage: LoginStage::AwaitingCode {
+                    phone_code_hash: sent.phone_code_hash,
+                    delivery: delivery.clone(),
+                },
                 api_id: body.api_id,
                 api_hash,
                 phone: phone.clone(),
@@ -157,6 +186,8 @@ async fn start(
     Ok(HttpResponse::Ok().json(StartResponse {
         sent: true,
         phone_hint: hint(&phone),
+        delivery: delivery.describe(),
+        numeric: delivery.numeric(),
     }))
 }
 
@@ -353,23 +384,62 @@ async fn code(
         ApiError::BadRequest("That attempt expired. Start again from your phone number.".into())
     })?;
 
-    let LoginStage::AwaitingCode(ref token) = entry.stage else {
+    let LoginStage::AwaitingCode {
+        ref phone_code_hash,
+        ref delivery,
+    } = entry.stage
+    else {
         return Err(ApiError::BadRequest(
             "This attempt is waiting for your two-step password, not a code.".into(),
         ));
     };
 
-    // Telegram codes are digits; people paste them with spaces from SMS.
-    let typed: String = body.code.chars().filter(|c| c.is_ascii_digit()).collect();
+    // Only strip to digits when the code actually is digits. Telegram's
+    // word and phrase codes would otherwise be erased entirely, leaving
+    // the user unable to submit anything at all.
+    let typed: String = if delivery.numeric() {
+        body.code.chars().filter(|c| c.is_ascii_digit()).collect()
+    } else {
+        body.code.trim().to_string()
+    };
+
     if typed.is_empty() {
-        pending.insert(user.id, entry).await;
+        let hash = phone_code_hash.clone();
+        let kind = delivery.clone();
+        pending
+            .insert(
+                user.id,
+                Pending {
+                    stage: LoginStage::AwaitingCode {
+                        phone_code_hash: hash,
+                        delivery: kind,
+                    },
+                    ..entry
+                },
+            )
+            .await;
         return Err(ApiError::BadRequest("Enter the code Telegram sent you.".into()));
     }
 
-    let outcome = submit_code(&entry.connection, token, &typed).await;
+    let outcome = super::phone::sign_in(
+        &entry.connection.client,
+        &entry.phone,
+        phone_code_hash,
+        &typed,
+    )
+    .await
+    .map(|result| match result {
+        super::phone::SignIn::Done => CodeOutcome::SignedIn(Vec::new()),
+        super::phone::SignIn::NeedsPassword(token) => CodeOutcome::NeedsPassword(token),
+    });
 
     match outcome {
-        Ok(CodeOutcome::SignedIn(session)) => {
+        Ok(CodeOutcome::SignedIn(_)) => {
+            // Raw sign_in authorises the connection but returns nothing to
+            // store; the session has to be exported from the client that
+            // was just authorised.
+            let session = super::session_store::export(&entry.connection.session)
+                .map_err(|error| ApiError::Internal(anyhow::anyhow!("{error}")))?;
             let result = store_session(
                 &request,
                 &user,

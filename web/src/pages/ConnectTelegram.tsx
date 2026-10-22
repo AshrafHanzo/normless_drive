@@ -25,6 +25,7 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
   const [twoFactor, setTwoFactor] = useState("");
   const [busy, setBusy] = useState(false);
   const [qrUrl, setQrUrl] = useState<string | null>(null);
+  const [delivery, setDelivery] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const fail = (caught: unknown) =>
@@ -90,7 +91,8 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
 
   const sendCode = () =>
     run(async () => {
-      await api.telegram.start(Number(apiId), apiHash, phone);
+      const sent = await api.telegram.start(Number(apiId), apiHash, phone);
+      setDelivery(sent.delivery);
       setStep("code");
     });
 
@@ -288,7 +290,7 @@ export function ConnectTelegram({ onConnected }: { onConnected: () => void }) {
               // The full number, not the masked hint: a mistyped digit is
               // by far the most common reason no code arrives, and a
               // masked version hides exactly the mistake worth spotting.
-              subtitle={`Telegram sent a code to ${phone}.`}
+              subtitle={delivery || `Telegram sent a code to ${phone}.`}
             />
 
             <div className="rounded-[var(--radius-control)] border border-border bg-surface p-3">

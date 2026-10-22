@@ -17,6 +17,7 @@ pub mod files;
 pub mod folders;
 pub mod remote;
 pub mod qr;
+pub mod phone;
 pub mod routes;
 pub mod session_store;
 
@@ -79,8 +80,12 @@ impl Connection {
 
 /// Where a connection attempt has got to.
 pub enum LoginStage {
-    /// A code has been sent; waiting for the user to type it.
-    AwaitingCode(grammers_client::types::LoginToken),
+    /// A code has been sent; waiting for the user to type it. Carries the
+    /// hash Telegram issued and how it said the code was delivered.
+    AwaitingCode {
+        phone_code_hash: String,
+        delivery: phone::Delivery,
+    },
     /// The code was right but the account has 2FA; waiting for the password.
     AwaitingPassword(Box<grammers_client::types::PasswordToken>),
     /// A QR code is on screen; waiting for someone to scan it.
