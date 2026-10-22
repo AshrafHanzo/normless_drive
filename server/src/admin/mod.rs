@@ -20,6 +20,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/users", web::get().to(list_users))
             .route("/users/{id}/status", web::post().to(set_status))
             .route("/users/{id}/role", web::post().to(set_role))
+            .route("/users/{id}/permissions", web::get().to(get_permissions))
+            .route("/users/{id}/permissions", web::post().to(set_permissions))
             .route("/audit", web::get().to(list_audit)),
     );
 }
@@ -187,6 +189,97 @@ async fn set_role(
     .await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true, "role": role })))
+}
+
+async fn get_permissions(
+    _admin: AdminUser,
+    path: web::Path<Uuid>,
+    pool: web::Data<Db>,
+) -> ApiResult<HttpResponse> {
+    let target = path.into_inner();
+    let limits = crate::permissions::load(&pool, target).await?;
+    let used = crate::permissions::usage(&pool, target).await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "permissions": limits,
+        "used_bytes": used,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct PermissionChange {
+    pub can_upload: bool,
+    pub can_download: bool,
+    pub can_delete: bool,
+    pub can_create_folders: bool,
+    pub can_share: bool,
+    /// Bytes. Zero means no cap.
+    pub storage_quota_bytes: i64,
+}
+
+async fn set_permissions(
+    admin: AdminUser,
+    path: web::Path<Uuid>,
+    body: web::Json<PermissionChange>,
+    pool: web::Data<Db>,
+) -> ApiResult<HttpResponse> {
+    let target = path.into_inner();
+
+    if body.storage_quota_bytes < 0 {
+        return Err(ApiError::BadRequest(
+            "A storage limit cannot be negative. Use 0 for no limit.".into(),
+        ));
+    }
+
+    let client = pool.get().await?;
+    // Upsert: an account created before this table existed has no row yet,
+    // and an admin editing it should not have to care.
+    let affected = client
+        .execute(
+            "INSERT INTO user_permissions
+                (user_id, can_upload, can_download, can_delete,
+                 can_create_folders, can_share, storage_quota_bytes, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+             ON CONFLICT (user_id) DO UPDATE SET
+                can_upload = EXCLUDED.can_upload,
+                can_download = EXCLUDED.can_download,
+                can_delete = EXCLUDED.can_delete,
+                can_create_folders = EXCLUDED.can_create_folders,
+                can_share = EXCLUDED.can_share,
+                storage_quota_bytes = EXCLUDED.storage_quota_bytes,
+                updated_at = now()",
+            &[
+                &target,
+                &body.can_upload,
+                &body.can_download,
+                &body.can_delete,
+                &body.can_create_folders,
+                &body.can_share,
+                &body.storage_quota_bytes,
+            ],
+        )
+        .await?;
+
+    if affected == 0 {
+        return Err(ApiError::NotFound("No such user.".into()));
+    }
+
+    audit(
+        &pool,
+        Some(target),
+        Some(admin.0.id),
+        "admin.set_permissions",
+        Some(serde_json::json!({
+            "can_upload": body.can_upload,
+            "can_download": body.can_download,
+            "can_delete": body.can_delete,
+            "can_create_folders": body.can_create_folders,
+            "can_share": body.can_share,
+            "storage_quota_bytes": body.storage_quota_bytes,
+        })),
+    )
+    .await;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

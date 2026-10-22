@@ -6,12 +6,13 @@ import {
   FileImage,
   FileText,
   FileVideo,
+  FolderPlus,
   File as FileIcon,
   RotateCw,
   Unplug,
   Upload,
 } from "lucide-react";
-import { api, ApiError, type FileRow } from "../api";
+import { api, ApiError, type FileRow, type Folder } from "../api";
 import { Alert, Button, Card, Spinner } from "../ui";
 
 export function Files({
@@ -22,15 +23,20 @@ export function Files({
   onDisconnected: () => void;
 }) {
   const [files, setFiles] = useState<FileRow[] | null>(null);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  // undefined means Saved Messages, which has no folder row of its own.
+  const [folder, setFolder] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (which?: string) => {
     setError(null);
+    setFiles(null);
     try {
-      setFiles((await api.files.list()).files);
+      setFiles((await api.files.list(which)).files);
     } catch (caught) {
       setError(
         caught instanceof ApiError ? caught.message : "Could not load files.",
@@ -39,17 +45,30 @@ export function Files({
     }
   }, []);
 
+  const loadFolders = useCallback(async () => {
+    try {
+      setFolders((await api.folders.list()).folders);
+    } catch {
+      // A folder list that fails should not stop the files loading —
+      // Saved Messages still works without it.
+    }
+  }, []);
+
   useEffect(() => {
-    void load();
-  }, [load]);
+    void load(folder);
+  }, [load, folder]);
+
+  useEffect(() => {
+    void loadFolders();
+  }, [loadFolders]);
 
   async function send(file: File) {
     setUploading(true);
     setError(null);
     setProgress(`Uploading ${file.name}…`);
     try {
-      await api.files.upload(file);
-      await load();
+      await api.files.upload(file, folder);
+      await load(folder);
       setProgress(null);
     } catch (caught) {
       setProgress(null);
@@ -60,6 +79,31 @@ export function Files({
       if (picker.current) picker.current.value = "";
     }
   }
+
+  async function addFolder() {
+    const name = window.prompt("Folder name");
+    if (!name?.trim()) return;
+    setCreating(true);
+    setError(null);
+    try {
+      const made = await api.folders.create(name.trim());
+      await loadFolders();
+      setFolder(made.id);
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError
+          ? caught.message
+          : "Could not create the folder.",
+      );
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  const activeName =
+    folder === undefined
+      ? "Saved Messages"
+      : (folders.find((f) => f.id === folder)?.name ?? "Folder");
 
   return (
     <div
@@ -73,7 +117,7 @@ export function Files({
     >
       <header className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold text-ink">Saved Messages</h1>
+          <h1 className="text-lg font-semibold text-ink">{activeName}</h1>
           <p className="text-sm text-ink-muted">
             {files === null
               ? "Loading…"
@@ -83,7 +127,11 @@ export function Files({
         </div>
 
         <div className="flex gap-2">
-          <Button variant="ghost" onClick={() => void load()}>
+          <Button variant="ghost" busy={creating} onClick={() => void addFolder()}>
+            <FolderPlus className="h-3.5 w-3.5" />
+            New folder
+          </Button>
+          <Button variant="ghost" onClick={() => void load(folder)}>
             <RotateCw className="h-3.5 w-3.5" />
             Refresh
           </Button>
@@ -102,6 +150,24 @@ export function Files({
           />
         </div>
       </header>
+
+      {/* Folder tabs. Saved Messages is always first and always present —
+          it is the one location that needs no setup. */}
+      <div className="mb-4 flex flex-wrap gap-1.5">
+        <FolderTab
+          label="Saved Messages"
+          active={folder === undefined}
+          onClick={() => setFolder(undefined)}
+        />
+        {folders.map((item) => (
+          <FolderTab
+            key={item.id}
+            label={item.name}
+            active={folder === item.id}
+            onClick={() => setFolder(item.id)}
+          />
+        ))}
+      </div>
 
       {error && (
         <div className="mb-4">
@@ -127,7 +193,7 @@ export function Files({
       ) : (
         <Card className="divide-y divide-border-soft">
           {files.map((file) => (
-            <Row key={file.id} file={file} />
+            <Row key={file.id} file={file} folder={folder} />
           ))}
         </Card>
       )}
@@ -148,7 +214,30 @@ export function Files({
   );
 }
 
-function Row({ file }: { file: FileRow }) {
+function FolderTab({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+        active
+          ? "bg-accent text-white"
+          : "border border-border text-ink-muted hover:bg-surface hover:text-ink"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function Row({ file, folder }: { file: FileRow; folder: string | undefined }) {
   const Icon = iconFor(file.mime_type, file.name);
   return (
     <div className="flex items-center gap-3 px-4 py-3">
@@ -165,7 +254,7 @@ function Row({ file }: { file: FileRow }) {
           with a real progress bar, and a 2 GB file never passes through JS
           memory. */}
       <a
-        href={`/api/files/${file.id}/download`}
+        href={api.files.downloadUrl(file.id, folder)}
         className="flex items-center gap-1.5 rounded-[var(--radius-control)] border border-border
                    px-2.5 py-1.5 text-xs text-ink-muted transition-colors
                    hover:bg-surface hover:text-ink"

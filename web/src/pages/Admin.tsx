@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, Ban, ShieldCheck, ShieldOff, RotateCw } from "lucide-react";
+import {
+  Ban,
+  Check,
+  RotateCw,
+  ShieldCheck,
+  ShieldOff,
+  SlidersHorizontal,
+} from "lucide-react";
 import {
   api,
   ApiError,
@@ -10,6 +17,7 @@ import {
   type User,
 } from "../api";
 import { Alert, Badge, Button, Card, Spinner } from "../ui";
+import { PermissionsEditor } from "./PermissionsEditor";
 
 export function Admin({ me }: { me: User }) {
   const [users, setUsers] = useState<AdminUserRow[] | null>(null);
@@ -17,6 +25,7 @@ export function Admin({ me }: { me: User }) {
   const [error, setError] = useState<string | null>(null);
   // Per-row, so one slow request does not disable every button on the page.
   const [pendingRow, setPendingRow] = useState<string | null>(null);
+  const [editing, setEditing] = useState<AdminUserRow | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -129,6 +138,14 @@ export function Admin({ me }: { me: User }) {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1.5">
+                        <Button
+                          variant="ghost"
+                          busy={busy}
+                          onClick={() => setEditing(user)}
+                          title="Choose what this account may do"
+                        >
+                          <SlidersHorizontal className="h-3.5 w-3.5" />
+                        </Button>
                         {user.status !== "active" && (
                           <Button
                             variant="ghost"
@@ -181,6 +198,17 @@ export function Admin({ me }: { me: User }) {
           </table>
         </div>
       </Card>
+
+      {editing && (
+        <PermissionsEditor
+          user={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            void load();
+          }}
+        />
+      )}
 
       <section>
         <h2 className="mb-2 text-sm font-semibold text-ink">Recent activity</h2>

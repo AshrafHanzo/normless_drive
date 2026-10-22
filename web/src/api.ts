@@ -20,6 +20,23 @@ export interface AdminUserRow extends User {
   telegram_connected: boolean;
 }
 
+export interface Folder {
+  id: string;
+  channel_id: number;
+  name: string;
+  created_at: string;
+}
+
+export interface Permissions {
+  can_upload: boolean;
+  can_download: boolean;
+  can_delete: boolean;
+  can_create_folders: boolean;
+  can_share: boolean;
+  /// Bytes. Zero means no cap.
+  storage_quota_bytes: number;
+}
+
 export interface FileRow {
   id: number;
   name: string;
@@ -130,19 +147,35 @@ export const api = {
 
   me: () => request<User>("/api/auth/me"),
 
-  files: {
-    list: () => request<{ files: FileRow[] }>("/api/files"),
+  folders: {
+    list: () => request<{ folders: Folder[] }>("/api/folders"),
+    create: (name: string) =>
+      request<Folder>("/api/folders", {
+        method: "POST",
+        body: json({ name }),
+      }),
+  },
 
-    upload: async (file: File) => {
+  files: {
+    list: (folder?: string) =>
+      request<{ files: FileRow[] }>(
+        folder ? `/api/files?folder=${folder}` : "/api/files",
+      ),
+
+    downloadUrl: (id: number, folder?: string) =>
+      folder
+        ? `/api/files/${id}/download?folder=${folder}`
+        : `/api/files/${id}/download`,
+
+    upload: async (file: File, folder?: string) => {
       const form = new FormData();
       form.append("file", file);
       // No Content-Type header: the browser must set it so the multipart
       // boundary is included, and overriding it breaks the upload.
-      const response = await fetch("/api/files", {
-        method: "POST",
-        credentials: "same-origin",
-        body: form,
-      });
+      const response = await fetch(
+        folder ? `/api/files?folder=${folder}` : "/api/files",
+        { method: "POST", credentials: "same-origin", body: form },
+      );
       if (!response.ok) {
         const body = await response.json().catch(() => null);
         const detail = (body as { error?: { code?: string; message?: string } })
@@ -204,6 +237,17 @@ export const api = {
       request<{ ok: true; role: Role }>(`/api/admin/users/${id}/role`, {
         method: "POST",
         body: json({ role }),
+      }),
+
+    permissions: (id: string) =>
+      request<{ permissions: Permissions; used_bytes: number }>(
+        `/api/admin/users/${id}/permissions`,
+      ),
+
+    setPermissions: (id: string, permissions: Permissions) =>
+      request<{ ok: true }>(`/api/admin/users/${id}/permissions`, {
+        method: "POST",
+        body: json(permissions),
       }),
 
     audit: (limit = 100) =>

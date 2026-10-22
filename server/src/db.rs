@@ -65,6 +65,10 @@ pub async fn migrate(pool: &Db) -> anyhow::Result<()> {
             "0002_user_kdf_salt",
             include_str!("../migrations/0002_user_kdf_salt.sql"),
         ),
+        (
+            "0003_folders_and_shares",
+            include_str!("../migrations/0003_folders_and_shares.sql"),
+        ),
     ];
 
     let client = pool.get().await?;

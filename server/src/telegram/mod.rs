@@ -1,4 +1,4 @@
-﻿//! Connecting a user's Telegram account.
+//! Connecting a user's Telegram account.
 //!
 //! Telegram's login is a conversation: ask for a code, the user reads it off
 //! their phone, send it back, maybe answer a 2FA password too. The client
@@ -14,6 +14,7 @@
 
 pub mod connect;
 pub mod files;
+pub mod folders;
 pub mod routes;
 pub mod session_store;
 

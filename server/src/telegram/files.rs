@@ -11,9 +11,10 @@
 use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures::StreamExt;
-use grammers_client::types::{Media, Peer};
+use grammers_client::types::Media;
 use grammers_client::{Client, InputMessage};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use super::{connect::SharedClients, Connection, TelegramError};
 use crate::{
@@ -21,6 +22,7 @@ use crate::{
     db::Db,
     error::{ApiError, ApiResult},
     keycache::KeyCache,
+    permissions,
 };
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
@@ -45,20 +47,22 @@ pub struct FileRow {
 pub struct ListQuery {
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Which folder to read. Absent means Saved Messages.
+    #[serde(default)]
+    pub folder: Option<Uuid>,
 }
 
-/// Resolves the user's own chat, which is what Telegram calls Saved Messages.
-async fn saved_messages(client: &Client) -> Result<Peer, TelegramError> {
-    let me = client
-        .get_me()
-        .await
-        .map_err(|error| TelegramError::Other(format!("could not identify the account: {error}")))?;
-    Ok(Peer::User(me))
+/// Download and upload take the folder in the body or path rather than a
+/// list query, so they share this instead of `ListQuery`.
+#[derive(Deserialize)]
+pub struct FolderQuery {
+    #[serde(default)]
+    pub folder: Option<Uuid>,
 }
 
 /// Pulls the connection for the caller, translating the two "you need to
 /// sign in again" cases into something the UI can act on.
-async fn connection(
+pub async fn connection_for(
     request: &HttpRequest,
     user: &CurrentUser,
     keys: &KeyCache,
@@ -86,8 +90,8 @@ async fn list(
     clients: web::Data<SharedClients>,
     pool: web::Data<Db>,
 ) -> ApiResult<HttpResponse> {
-    let connection = connection(&request, &user, &keys, &clients, &pool).await?;
-    let peer = saved_messages(&connection.client).await?;
+    let connection = connection_for(&request, &user, &keys, &clients, &pool).await?;
+    let peer = super::folders::resolve(&connection.client, &pool, user.id, query.folder).await?;
 
     // Capped: Saved Messages can hold years of history, and walking all of
     // it on every page load would be slow and pointless.
@@ -127,13 +131,16 @@ async fn download(
     request: HttpRequest,
     user: CurrentUser,
     path: web::Path<i32>,
+    query: web::Query<FolderQuery>,
     keys: web::Data<KeyCache>,
     clients: web::Data<SharedClients>,
     pool: web::Data<Db>,
 ) -> ApiResult<HttpResponse> {
+    permissions::require(&pool, user.id, permissions::Capability::Download).await?;
+
     let message_id = path.into_inner();
-    let connection = connection(&request, &user, &keys, &clients, &pool).await?;
-    let peer = saved_messages(&connection.client).await?;
+    let connection = connection_for(&request, &user, &keys, &clients, &pool).await?;
+    let peer = super::folders::resolve(&connection.client, &pool, user.id, query.folder).await?;
 
     let messages = connection
         .client
@@ -193,13 +200,16 @@ async fn download(
 async fn upload(
     request: HttpRequest,
     user: CurrentUser,
+    query: web::Query<FolderQuery>,
     mut payload: Multipart,
     keys: web::Data<KeyCache>,
     clients: web::Data<SharedClients>,
     pool: web::Data<Db>,
 ) -> ApiResult<HttpResponse> {
-    let connection = connection(&request, &user, &keys, &clients, &pool).await?;
-    let peer = saved_messages(&connection.client).await?;
+    permissions::require(&pool, user.id, permissions::Capability::Upload).await?;
+
+    let connection = connection_for(&request, &user, &keys, &clients, &pool).await?;
+    let peer = super::folders::resolve(&connection.client, &pool, user.id, query.folder).await?;
 
     let Some(field) = payload
         .next()
@@ -239,6 +249,8 @@ async fn upload(
     }
 
     let size = bytes.len();
+    permissions::check_quota(&pool, user.id, size as i64).await?;
+
     let mut cursor = std::io::Cursor::new(bytes.freeze());
     let uploaded = connection
         .client
@@ -249,11 +261,33 @@ async fn upload(
     // `text`/`document` are builder methods on an existing InputMessage,
     // not constructors — hence building from an empty caption rather than
     // calling InputMessage::text directly.
-    connection
+    let message = connection
         .client
         .send_message(&peer, InputMessage::from("").document(uploaded))
         .await
         .map_err(|error| TelegramError::Other(format!("could not attach the file: {error}")))?;
+
+    // Recorded for the quota. A failure here must not fail an upload that
+    // already succeeded — the file is in Telegram either way, and the
+    // worst outcome is that it is not counted.
+    if let Ok(db) = pool.get().await {
+        let recorded = db
+            .execute(
+                "INSERT INTO uploads (user_id, folder_id, message_id, name, size_bytes)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &user.id,
+                    &query.folder,
+                    &message.id(),
+                    &name,
+                    &(size as i64),
+                ],
+            )
+            .await;
+        if let Err(error) = recorded {
+            tracing::warn!(?error, "upload succeeded but was not recorded for the quota");
+        }
+    }
 
     tracing::info!(user = %user.id, name = %name, size, "uploaded");
 
