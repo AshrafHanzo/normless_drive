@@ -123,32 +123,68 @@ pub struct SentCode {
     pub delivery: Delivery,
 }
 
+fn request(api_id: i32, api_hash: &str, phone: &str) -> tl::functions::auth::SendCode {
+    tl::functions::auth::SendCode {
+        phone_number: phone.to_string(),
+        api_id,
+        api_hash: api_hash.to_string(),
+        settings: tl::enums::CodeSettings::Settings(tl::types::CodeSettings {
+            allow_flashcall: false,
+            current_number: false,
+            allow_app_hash: false,
+            allow_missed_call: false,
+            // Explicitly off. Firebase verification needs Play Integrity
+            // from a real Android app, which a server cannot produce — so
+            // there is no point inviting Telegram to choose it.
+            allow_firebase: false,
+            unknown_number: false,
+            logout_tokens: None,
+            token: None,
+            app_sandbox: None,
+        }),
+    }
+}
+
+/// Reads the datacenter number out of a `PHONE_MIGRATE_n` error.
+fn migrate_target(error: &grammers_client::InvocationError) -> Option<i32> {
+    let grammers_client::InvocationError::Rpc(rpc) = error else {
+        return None;
+    };
+    (rpc.code == 303 && rpc.name.contains("PHONE_MIGRATE"))
+        .then_some(rpc.value)
+        .flatten()
+        .map(|value| value as i32)
+}
+
 /// Asks Telegram to send a login code, and reports how it chose to.
+///
+/// Takes the whole `Connection` rather than just the client because a
+/// number belonging to another datacenter has to be retried there, and
+/// that means moving the connection.
 pub async fn send_code(
-    client: &Client,
+    connection: &super::Connection,
     api_id: i32,
     api_hash: &str,
     phone: &str,
 ) -> Result<SentCode, TelegramError> {
-    let result = client
-        .invoke(&tl::functions::auth::SendCode {
-            phone_number: phone.to_string(),
-            api_id,
-            api_hash: api_hash.to_string(),
-            settings: tl::enums::CodeSettings::Settings(tl::types::CodeSettings {
-                allow_flashcall: false,
-                current_number: false,
-                allow_app_hash: false,
-                allow_missed_call: false,
-                allow_firebase: false,
-                unknown_number: false,
-                logout_tokens: None,
-                token: None,
-                app_sandbox: None,
-            }),
-        })
-        .await
-        .map_err(|error| super::classify_public(&error))?;
+    let client: &Client = &connection.client;
+
+    let result = match client.invoke(&request(api_id, api_hash, phone)).await {
+        Ok(result) => result,
+        Err(error) => {
+            // Telegram shards accounts by datacenter. An Indian number
+            // typically lives on DC 5 while a fresh connection starts on
+            // DC 2, so this is the common case, not an edge case.
+            let Some(dc_id) = migrate_target(&error) else {
+                return Err(super::classify_public(&error));
+            };
+            connection.migrate_to(dc_id);
+            client
+                .invoke(&request(api_id, api_hash, phone))
+                .await
+                .map_err(|error| super::classify_public(&error))?
+        }
+    };
 
     match result {
         tl::enums::auth::SentCode::Code(code) => {

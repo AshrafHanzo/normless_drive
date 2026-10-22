@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 use grammers_client::{Client, SignInError};
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::MemorySession;
-use grammers_session::SessionData;
+// `Session` is needed in scope for `home_dc_id`/`set_home_dc_id`: they are
+// trait methods, not inherent ones on MemorySession.
+use grammers_session::{Session, SessionData};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -65,6 +67,29 @@ impl Connection {
             handle,
             task,
         }
+    }
+
+    /// Moves this connection to another datacenter.
+    ///
+    /// Telegram shards accounts across datacenters, and a connection
+    /// starts on a default one. Asking about a number that lives
+    /// elsewhere answers `PHONE_MIGRATE_n` rather than doing the work, and
+    /// the request has to be made again against DC `n`.
+    ///
+    /// grammers' own wrappers do this internally, which is why the
+    /// high-level API never surfaces it — but the raw calls this app makes
+    /// to read the code delivery type have to handle it themselves.
+    pub fn migrate_to(&self, dc_id: i32) {
+        let old = self.session.home_dc_id();
+        if old == dc_id {
+            return;
+        }
+        // Dropping the old connection first frees a socket that will never
+        // be used again, and lets the new datacenter export an
+        // authorization cleanly.
+        self.handle.disconnect_from_dc(old);
+        self.session.set_home_dc_id(dc_id);
+        tracing::info!(from = old, to = dc_id, "migrated datacenter");
     }
 
     /// Closes the connection and waits for its task to finish.

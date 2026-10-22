@@ -1,4 +1,4 @@
-﻿//! The connect wizard, server side.
+//! The connect wizard, server side.
 //!
 //!   POST /api/telegram/start     api_id, api_hash, phone  -> code sent
 //!   POST /api/telegram/code      code                     -> done | needs password
@@ -148,7 +148,7 @@ async fn start(
     ));
     let connection = super::Connection::open(session, body.api_id);
 
-    let sent = match super::phone::send_code(&connection.client, body.api_id, &api_hash, &phone)
+    let sent = match super::phone::send_code(&connection, body.api_id, &api_hash, &phone)
         .await
     {
         Ok(sent) => sent,
