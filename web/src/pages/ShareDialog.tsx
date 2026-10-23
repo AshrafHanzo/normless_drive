@@ -11,16 +11,20 @@ export function ShareDialog({
   folderId,
   folderName,
   onClose,
+  onFolderCreated,
 }: {
   folderId: string | undefined;
   folderName: string;
   onClose: () => void;
+  onFolderCreated?: (id: string) => void;
 }) {
   const [shares, setShares] = useState<Share[] | null>(null);
   const [offlineAvailable, setOfflineAvailable] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [mode, setMode] = useState<"existing" | "new">("existing");
+  const [newFolderName, setNewFolderName] = useState("");
 
   const [permissions, setPermissions] = useState<SharePermissions>({
     can_download: true,
@@ -56,9 +60,23 @@ export function ShareDialog({
     setBusy(true);
     setError(null);
     try {
+      // Creating the folder first, so a failure there stops before a
+      // link exists pointing at nothing.
+      let target = folderId;
+      if (mode === "new") {
+        const name = newFolderName.trim();
+        if (!name) {
+          setError("Give the new folder a name.");
+          setBusy(false);
+          return;
+        }
+        target = (await api.folders.create(name)).id;
+        onFolderCreated?.(target);
+      }
+
       await api.shares.create({
         label: label.trim() || undefined,
-        folder_id: folderId,
+        folder_id: target,
         permissions,
         password: password || undefined,
         expiry_hours: expiryHours ? Number(expiryHours) : undefined,
@@ -66,6 +84,8 @@ export function ShareDialog({
         allow_offline: allowOffline,
       });
       setLabel("");
+      setNewFolderName("");
+      setMode("existing");
       setPassword("");
       setExpiryHours("");
       setUsageLimit("");
@@ -126,7 +146,47 @@ export function ShareDialog({
             </div>
           )}
 
+          {/* The desktop app lets you make a folder from inside this
+              dialog, because "share something new with someone" is one
+              intention, not two. Without it you have to cancel, create a
+              folder, and start again. */}
+          <div className="mb-4 grid grid-cols-2 gap-2">
+            <button
+              onClick={() => setMode("existing")}
+              className={`rounded-[var(--radius-control)] border px-3 py-2 text-xs font-medium transition-colors ${
+                mode === "existing"
+                  ? "border-accent bg-accent-soft text-accent"
+                  : "border-border text-ink-muted hover:bg-surface hover:text-ink"
+              }`}
+            >
+              Share {folderName}
+            </button>
+            <button
+              onClick={() => setMode("new")}
+              className={`rounded-[var(--radius-control)] border px-3 py-2 text-xs font-medium transition-colors ${
+                mode === "new"
+                  ? "border-accent bg-accent-soft text-accent"
+                  : "border-border text-ink-muted hover:bg-surface hover:text-ink"
+              }`}
+            >
+              Share a new folder
+            </button>
+          </div>
+
           <div className="space-y-3">
+            {mode === "new" && (
+              <Field
+                label="New folder name"
+                autoFocus
+                required
+                maxLength={100}
+                value={newFolderName}
+                onChange={(e) => setNewFolderName(e.target.value)}
+                placeholder="Client intake"
+                hint="Created as a private Telegram channel, then shared."
+              />
+            )}
+
             <Field
               label="Label (optional)"
               value={label}

@@ -1,27 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ChevronLeft,
   FileArchive,
   FileAudio,
   FileImage,
   FileText,
   FileVideo,
   File as FileIcon,
-  FolderPlus,
   Globe,
-  HardDrive,
   Inbox,
   LayoutGrid,
   List,
   LogOut,
   RotateCw,
-  RefreshCcw,
   Search,
   Settings,
   Share2,
   Shield,
   Trash2,
-  Unplug,
   Upload,
 } from "lucide-react";
 import {
@@ -29,12 +24,15 @@ import {
   ApiError,
   type FileRow,
   type Folder,
+  type Group,
   type User,
 } from "../api";
 import { Alert, Button, Spinner } from "../ui";
 import { Preferences } from "./Preferences";
 import { RemoteUpload } from "./RemoteUpload";
 import { NewFolder } from "./NewFolder";
+import { NewGroup } from "./NewGroup";
+import { Sidebar } from "./Sidebar";
 import { ShareDialog } from "./ShareDialog";
 
 type View = "list" | "grid";
@@ -67,6 +65,8 @@ export function Drive({
   const [dragging, setDragging] = useState(false);
   const [newFolder, setNewFolder] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [newGroup, setNewGroup] = useState(false);
+  const [groups, setGroups] = useState<Group[]>([]);
   const picker = useRef<HTMLInputElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
 
@@ -84,6 +84,7 @@ export function Drive({
   const loadFolders = useCallback(async () => {
     try {
       setFolders((await api.folders.list()).folders);
+      setGroups((await api.groups.list()).groups);
     } catch {
       // Saved Messages still works without the folder list, so a failure
       // here must not blank the page.
@@ -178,96 +179,27 @@ export function Drive({
         if (dropped) void send(dropped);
       }}
     >
-      {/* ── Sidebar ─────────────────────────────────────────────── */}
-      <aside
-        className={`flex shrink-0 flex-col border-r border-border bg-surface transition-all
-                    ${sidebarOpen ? "w-64" : "w-0 overflow-hidden"}`}
-      >
-        <div className="flex items-center justify-between gap-2 px-4 py-3.5">
-          <div className="flex min-w-0 items-center gap-2.5">
-            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[var(--radius-control)] bg-accent">
-              <HardDrive className="h-4 w-4 text-white" />
-            </div>
-            <span className="truncate text-sm font-semibold text-ink">
-              Normless Drive
-            </span>
-          </div>
-          <button
-            onClick={() => setSidebarOpen(false)}
-            aria-label="Collapse sidebar"
-            className="text-ink-faint transition-colors hover:text-ink"
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </button>
-        </div>
-
-        <nav className="flex-1 overflow-y-auto px-2 pb-2">
-          <SidebarItem
-            icon={Inbox}
-            label="Saved Messages"
-            active={folder === undefined}
-            onClick={() => setFolder(undefined)}
-          />
-          {folders.length > 0 && (
-            <p className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-ink-faint">
-              Folders
-            </p>
-          )}
-          {folders.map((item) => (
-            <SidebarItem
-              key={item.id}
-              icon={FolderPlus}
-              label={item.name}
-              active={folder === item.id}
-              onClick={() => setFolder(item.id)}
-            />
-          ))}
-        </nav>
-
-        <div className="border-t border-border p-3">
-          <Button
-            variant="ghost"
-            onClick={() => setNewFolder(true)}
-            className="w-full"
-          >
-            <FolderPlus className="h-3.5 w-3.5" />
-            Create folder
-          </Button>
-          <Button
-            variant="ghost"
-            busy={syncing}
-            onClick={() => void syncFolders()}
-            className="mt-1.5 w-full"
-            title="Find folders created in the desktop app"
-          >
-            <RefreshCcw className="h-3.5 w-3.5" />
-            Sync from Telegram
-          </Button>
-
-          <div className="mt-3 flex items-center gap-1.5 px-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-success)]" />
-            <span className="text-xs text-ink-muted">Connected to Telegram</span>
-          </div>
-          <p className="mt-1 px-1 text-[11px] text-ink-faint">
-            {phoneHint ?? ""} · {formatSize(totalBytes)} here
-          </p>
-
-          <div className="mt-3 flex gap-1.5">
-            <Button
-              variant="ghost"
-              onClick={async () => {
-                await api.telegram.disconnect().catch(() => undefined);
-                onDisconnected();
-              }}
-              className="flex-1"
-            >
-              <Unplug className="h-3.5 w-3.5" />
-              Disconnect
-            </Button>
-          </div>
-        </div>
-      </aside>
-
+      {sidebarOpen && (
+        <Sidebar
+          folders={folders}
+          groups={groups}
+          selected={folder}
+          phoneHint={phoneHint}
+          totalBytes={formatSize(totalBytes)}
+          creating={false}
+          syncing={syncing}
+          onSelect={setFolder}
+          onNewFolder={() => setNewFolder(true)}
+          onNewGroup={() => setNewGroup(true)}
+          onSync={() => void syncFolders()}
+          onDisconnect={async () => {
+            await api.telegram.disconnect().catch(() => undefined);
+            onDisconnected();
+          }}
+          onCollapse={() => setSidebarOpen(false)}
+          onChanged={() => void loadFolders()}
+        />
+      )}
       {/* ── Main ────────────────────────────────────────────────── */}
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center gap-3 border-b border-border px-4 py-3">
@@ -390,9 +322,22 @@ export function Drive({
           folderId={folder}
           folderName={activeName}
           onClose={() => setSharing(false)}
+          onFolderCreated={(id) => {
+            void loadFolders();
+            setFolder(id);
+          }}
         />
       )}
       {prefs && <Preferences phoneHint={phoneHint} onClose={() => setPrefs(false)} />}
+      {newGroup && (
+        <NewGroup
+          onClose={() => setNewGroup(false)}
+          onCreated={() => {
+            setNewGroup(false);
+            void loadFolders();
+          }}
+        />
+      )}
       {newFolder && (
         <NewFolder
           onClose={() => setNewFolder(false)}
@@ -414,33 +359,6 @@ export function Drive({
         />
       )}
     </div>
-  );
-}
-
-function SidebarItem({
-  icon: Icon,
-  label,
-  active,
-  onClick,
-}: {
-  icon: typeof Inbox;
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`flex w-full items-center gap-2.5 rounded-[var(--radius-control)] px-2.5 py-2
-                  text-left text-sm transition-colors ${
-                    active
-                      ? "bg-accent-soft font-medium text-accent"
-                      : "text-ink-muted hover:bg-canvas hover:text-ink"
-                  }`}
-    >
-      <Icon className="h-4 w-4 shrink-0" />
-      <span className="truncate">{label}</span>
-    </button>
   );
 }
 

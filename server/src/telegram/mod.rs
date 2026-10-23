@@ -15,6 +15,7 @@
 pub mod connect;
 pub mod files;
 pub mod folders;
+pub mod groups;
 pub mod remote;
 pub mod qr;
 pub mod phone;

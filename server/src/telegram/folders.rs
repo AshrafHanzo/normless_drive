@@ -43,6 +43,7 @@ pub struct FolderRow {
     pub id: Uuid,
     pub channel_id: i64,
     pub name: String,
+    pub group_id: Option<Uuid>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -50,7 +51,7 @@ async fn list(user: CurrentUser, pool: web::Data<Db>) -> ApiResult<HttpResponse>
     let client = pool.get().await?;
     let rows = client
         .query(
-            "SELECT id, channel_id, name, created_at
+            "SELECT id, channel_id, name, group_id, created_at
                FROM folders WHERE user_id = $1
               ORDER BY display_order, created_at",
             &[&user.id],
@@ -63,6 +64,7 @@ async fn list(user: CurrentUser, pool: web::Data<Db>) -> ApiResult<HttpResponse>
             id: row.get("id"),
             channel_id: row.get("channel_id"),
             name: row.get("name"),
+            group_id: row.get("group_id"),
             created_at: row.get("created_at"),
         })
         .collect();
@@ -119,6 +121,7 @@ async fn create(
         id: row.get("id"),
         channel_id,
         name: name.to_string(),
+        group_id: None,
         created_at: row.get("created_at"),
     }))
 }

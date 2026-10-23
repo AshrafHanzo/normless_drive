@@ -46,7 +46,15 @@ export interface Folder {
   id: string;
   channel_id: number;
   name: string;
+  group_id: string | null;
   created_at: string;
+}
+
+export interface Group {
+  id: string;
+  name: string;
+  color_hex: string;
+  display_order: number;
 }
 
 export interface Permissions {
@@ -229,6 +237,22 @@ export const api = {
 
     downloadUrl: (token: string, id: number) =>
       `/api/s/${token}/files/${id}/download`,
+  },
+
+  groups: {
+    list: () => request<{ groups: Group[] }>("/api/groups"),
+    create: (name: string, color_hex?: string) =>
+      request<Group>("/api/groups", {
+        method: "POST",
+        body: json({ name, color_hex }),
+      }),
+    remove: (id: string) =>
+      request<{ ok: true }>(`/api/groups/${id}`, { method: "DELETE" }),
+    assign: (folder_id: string, group_id: string | null) =>
+      request<{ ok: true }>("/api/groups/assign", {
+        method: "POST",
+        body: json({ folder_id, group_id }),
+      }),
   },
 
   folders: {
