@@ -173,6 +173,12 @@ export const api = {
       body: json({ email, password }),
     }),
 
+  unlock: (password: string) =>
+    request<{ ok: true }>("/api/auth/unlock", {
+      method: "POST",
+      body: json({ password }),
+    }),
+
   logout: () => request<{ ok: true }>("/api/auth/logout", { method: "POST" }),
 
   me: () => request<User>("/api/auth/me"),

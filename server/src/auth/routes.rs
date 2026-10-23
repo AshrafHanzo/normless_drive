@@ -27,6 +27,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/login", web::post().to(login))
             .route("/logout", web::post().to(logout))
             .route("/password", web::post().to(change_password))
+            .route("/unlock", web::post().to(unlock))
             .route("/me", web::get().to(me)),
     );
 }
@@ -361,6 +362,53 @@ async fn change_password(
         "ok": true,
         "message": "Password changed. Please sign in again."
     })))
+}
+
+#[derive(Deserialize)]
+pub struct Unlock {
+    pub password: String,
+}
+
+/// Re-derives the wrapping key for an already-signed-in session.
+///
+/// The key lives only in memory and is lost on restart, so a perfectly
+/// valid login can find itself unable to read its own Telegram session.
+/// Forcing a full sign-out to recover is both annoying and misleading —
+/// the session is fine, it is only the key that is missing. This asks for
+/// the password, derives the key again, and carries on.
+async fn unlock(
+    request: HttpRequest,
+    user: CurrentUser,
+    body: web::Json<Unlock>,
+    pool: web::Data<Db>,
+    keys: web::Data<KeyCache>,
+) -> ApiResult<HttpResponse> {
+    let cookie = request
+        .cookie(SESSION_COOKIE)
+        .ok_or(ApiError::Unauthenticated)?;
+
+    let client = pool.get().await?;
+    let row = client
+        .query_one(
+            "SELECT password_hash, kdf_salt FROM users WHERE id = $1",
+            &[&user.id],
+        )
+        .await?;
+    let stored: String = row.get("password_hash");
+    let kdf_salt: Vec<u8> = row.get("kdf_salt");
+
+    let ok = verify_password(&body.password, &stored)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+    if !ok {
+        return Err(ApiError::Forbidden("That password is wrong.".into()));
+    }
+
+    let key = crypto::derive_key(&body.password, &kdf_salt)
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!(error)))?;
+    keys.insert(hash_session_token(cookie.value()), key);
+
+    tracing::info!(user = %user.id, "session unlocked");
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true })))
 }
 
 async fn me(user: CurrentUser, pool: web::Data<Db>) -> ApiResult<HttpResponse> {

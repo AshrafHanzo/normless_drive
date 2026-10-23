@@ -7,7 +7,7 @@ import { ConnectTelegram } from "./pages/ConnectTelegram";
 import { Drive } from "./pages/Drive";
 import { PublicShare } from "./pages/PublicShare";
 import { SignIn } from "./pages/SignIn";
-import { Button, Spinner } from "./ui";
+import { Alert, Button, Card, PasswordField, Spinner } from "./ui";
 
 export default function App() {
   // Applied before anything meaningful renders so a reload does not flash
@@ -97,24 +97,57 @@ function SignedInApp() {
 /// Shown when the cookie is still good but the key that decrypts this
 /// user's Telegram session is gone — which is what a server restart does,
 /// by design, since that key is never written to disk.
-function Locked({ onSignOut }: { onSignOut: () => void }) {
+function Locked({ onUnlocked }: { onUnlocked: () => void }) {
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await api.unlock(password);
+      onUnlocked();
+    } catch (caught) {
+      setError(
+        caught instanceof ApiError ? caught.message : "Could not unlock.",
+      );
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="flex min-h-full items-center justify-center bg-canvas px-4">
-      <div className="w-full max-w-sm text-center">
-        <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-[var(--radius-card)] bg-accent-soft">
-          <Lock className="h-5 w-5 text-accent" />
+    <div className="flex min-h-full items-center justify-center bg-canvas px-4 py-12">
+      <div className="w-full max-w-sm">
+        <div className="mb-5 text-center">
+          <div className="mx-auto mb-3 flex h-11 w-11 items-center justify-center rounded-[var(--radius-card)] bg-accent-soft">
+            <Lock className="h-5 w-5 text-accent" />
+          </div>
+          <h1 className="text-base font-semibold text-ink">Unlock your drive</h1>
+          <p className="mx-auto mt-2 text-sm leading-relaxed text-ink-muted">
+            You are still signed in. The key that decrypts your Telegram
+            connection is kept only in memory and was cleared when the
+            server restarted — that is deliberate, and it is what makes a
+            stolen database useless.
+          </p>
         </div>
-        <h1 className="text-base font-semibold text-ink">
-          Sign in again to unlock your drive
-        </h1>
-        <p className="mx-auto mt-2 max-w-xs text-sm leading-relaxed text-ink-muted">
-          Your Telegram connection is still here. The key that reads it is
-          held only in memory and was cleared when the server restarted —
-          that is deliberate, and it is why a stolen database is useless.
-        </p>
-        <Button onClick={onSignOut} className="mt-5 w-full">
-          Sign in again
-        </Button>
+
+        <Card className="p-5">
+          <form onSubmit={submit} className="space-y-3">
+            {error && <Alert tone="error">{error}</Alert>}
+            <PasswordField
+              label="Your password"
+              autoFocus
+              required
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+            <Button type="submit" busy={busy} className="w-full">
+              Unlock
+            </Button>
+          </form>
+        </Card>
       </div>
     </div>
   );
@@ -144,7 +177,10 @@ function TelegramGate({
         // this person signed in. Everything Telegram-related will fail
         // until they sign in again, so say so instead of letting them
         // discover it one broken action at a time.
-        setLocked(status.connected && !status.unlocked);
+        // Needed whether or not Telegram is connected: connecting also
+        // requires the key, so prompting only afterwards would fail the
+        // very first attempt.
+        setLocked(!status.unlocked);
       })
       .catch(() => setConnected(false));
   }, []);
@@ -152,7 +188,7 @@ function TelegramGate({
   useEffect(refresh, [refresh]);
 
   if (connected === null) return <Spinner />;
-  if (locked) return <Locked onSignOut={onSignOut} />;
+  if (locked) return <Locked onUnlocked={refresh} />;
   if (!connected) return <ConnectTelegram onConnected={refresh} />;
 
   return (
