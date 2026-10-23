@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ArrowLeft, Lock } from "lucide-react";
 import { api, ApiError, type User } from "./api";
 import { applyTheme, loadTheme, watchSystemTheme } from "./theme";
+import { applyPreset, loadPreset } from "./themes";
 import { Admin } from "./pages/Admin";
 import { ConnectTelegram } from "./pages/ConnectTelegram";
 import { Drive } from "./pages/Drive";
@@ -13,7 +14,10 @@ export default function App() {
   // Applied before anything meaningful renders so a reload does not flash
   // the wrong theme. index.html starts dark; this corrects it.
   useEffect(() => {
+    // A preset overrides the light/dark choice entirely, so it is
+    // applied second and wins.
     applyTheme(loadTheme());
+    applyPreset(loadPreset());
     return watchSystemTheme(loadTheme);
   }, []);
 

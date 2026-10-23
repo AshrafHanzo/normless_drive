@@ -1,11 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Ban,
   Check,
+  Clock,
   RotateCw,
+  Search,
   ShieldCheck,
   ShieldOff,
   SlidersHorizontal,
+  UserCheck,
+  Users,
 } from "lucide-react";
 import {
   api,
@@ -26,6 +30,7 @@ export function Admin({ me }: { me: User }) {
   // Per-row, so one slow request does not disable every button on the page.
   const [pendingRow, setPendingRow] = useState<string | null>(null);
   const [editing, setEditing] = useState<AdminUserRow | null>(null);
+  const [query, setQuery] = useState("");
 
   const load = useCallback(async () => {
     setError(null);
@@ -54,9 +59,7 @@ export function Admin({ me }: { me: User }) {
       await run();
       await load();
     } catch (caught) {
-      setError(
-        caught instanceof ApiError ? caught.message : "That did not work.",
-      );
+      setError(caught instanceof ApiError ? caught.message : "That did not work.");
     } finally {
       setPendingRow(null);
     }
@@ -67,136 +70,165 @@ export function Admin({ me }: { me: User }) {
   const setRole = (id: string, role: Role) =>
     act(id, () => api.admin.setRole(id, role));
 
+  const shown = useMemo(() => {
+    if (!users) return null;
+    const needle = query.trim().toLowerCase();
+    return needle
+      ? users.filter((u) => u.email.toLowerCase().includes(needle))
+      : users;
+  }, [users, query]);
+
   if (!users) return <Spinner />;
 
-  const pending = users.filter((u) => u.status === "pending");
+  const pending = users.filter((u) => u.status === "pending").length;
+  const active = users.filter((u) => u.status === "active").length;
+  const connected = users.filter((u) => u.telegram_connected).length;
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6 px-4 py-8">
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-lg font-semibold text-ink">Administration</h1>
-          <p className="text-sm text-ink-muted">
-            {users.length} account{users.length === 1 ? "" : "s"}
-            {pending.length > 0 && (
-              <span className="text-warn">
-                {" "}
-                · {pending.length} waiting for approval
-              </span>
-            )}
-          </p>
+    <div className="mx-auto max-w-5xl space-y-5 px-4 py-6">
+      <header>
+        <h1 className="text-xl font-semibold tracking-tight text-ink">
+          Administration
+        </h1>
+        <p className="mt-0.5 text-sm text-ink-muted">
+          Who may use this drive, and what they are allowed to do.
+        </p>
+      </header>
+
+      {/* Counts first. The number that matters is how many people are
+          waiting on you — everything else is context. */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat
+          icon={Clock}
+          label="Waiting for approval"
+          value={pending}
+          tone={pending > 0 ? "warn" : "plain"}
+        />
+        <Stat icon={UserCheck} label="Active" value={active} tone="plain" />
+        <Stat icon={Users} label="Accounts" value={users.length} tone="plain" />
+        <Stat
+          icon={ShieldCheck}
+          label="Telegram linked"
+          value={connected}
+          tone="plain"
+        />
+      </div>
+
+      {error && <Alert tone="error">{error}</Alert>}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-0 flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-faint" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search accounts…"
+            className="w-full rounded-full border border-border bg-canvas py-1.5 pl-9 pr-3
+                       text-sm text-ink outline-none transition-colors
+                       placeholder:text-ink-faint focus:border-accent"
+          />
         </div>
         <Button variant="ghost" onClick={() => void load()}>
           <RotateCw className="h-3.5 w-3.5" />
           Refresh
         </Button>
-      </header>
+      </div>
 
-      {error && <Alert tone="error">{error}</Alert>}
+      <Card className="overflow-hidden">
+        {shown && shown.length === 0 ? (
+          <p className="px-4 py-12 text-center text-sm text-ink-faint">
+            No accounts match.
+          </p>
+        ) : (
+          <div className="divide-y divide-border-soft">
+            {shown?.map((user) => {
+              const isSelf = user.id === me.id;
+              const busy = pendingRow === user.id;
+              return (
+                <div
+                  key={user.id}
+                  className="flex flex-wrap items-center gap-3 px-4 py-3 transition-colors hover:bg-surface"
+                >
+                  <Avatar email={user.email} />
 
-      <Card>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border text-left text-xs text-ink-faint">
-                <th className="px-4 py-3 font-medium">Account</th>
-                <th className="px-4 py-3 font-medium">Status</th>
-                <th className="px-4 py-3 font-medium">Role</th>
-                <th className="px-4 py-3 font-medium">Telegram</th>
-                <th className="px-4 py-3 font-medium">Last seen</th>
-                <th className="px-4 py-3 text-right font-medium">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {users.map((user) => {
-                const isSelf = user.id === me.id;
-                const busy = pendingRow === user.id;
-                return (
-                  <tr
-                    key={user.id}
-                    className="border-b border-border-soft last:border-0"
-                  >
-                    <td className="px-4 py-3">
-                      <div className="font-medium text-ink">{user.email}</div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-medium text-ink">
+                      {user.email}
                       {isSelf && (
-                        <div className="text-xs text-ink-faint">You</div>
+                        <span className="ml-1.5 text-xs font-normal text-ink-faint">
+                          you
+                        </span>
                       )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <Badge tone={user.status}>{user.status}</Badge>
-                    </td>
-                    <td className="px-4 py-3">
-                      <Badge tone={user.role}>{user.role}</Badge>
-                    </td>
-                    <td className="px-4 py-3 text-ink-muted">
-                      {user.telegram_connected ? "Connected" : "—"}
-                    </td>
-                    <td className="px-4 py-3 text-ink-muted">
-                      {user.last_login_at
-                        ? new Date(user.last_login_at).toLocaleDateString()
-                        : "Never"}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex justify-end gap-1.5">
-                        <Button
-                          variant="ghost"
+                    </p>
+                    <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-ink-faint">
+                      <span>
+                        {user.telegram_connected
+                          ? "Telegram linked"
+                          : "No Telegram yet"}
+                      </span>
+                      <span aria-hidden>·</span>
+                      <span>
+                        {user.last_login_at
+                          ? `seen ${new Date(user.last_login_at).toLocaleDateString()}`
+                          : "never signed in"}
+                      </span>
+                    </p>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <Badge tone={user.status}>{user.status}</Badge>
+                    <Badge tone={user.role}>{user.role}</Badge>
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1">
+                    {user.status !== "active" && (
+                      <Button
+                        busy={busy}
+                        onClick={() => setStatus(user.id, "active")}
+                        title="Allow this account to sign in"
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                        Approve
+                      </Button>
+                    )}
+                    <Action
+                      icon={SlidersHorizontal}
+                      label="Permissions and storage limit"
+                      busy={busy}
+                      onClick={() => setEditing(user)}
+                    />
+                    {user.status === "active" && !isSelf && (
+                      <Action
+                        icon={Ban}
+                        label="Suspend"
+                        danger
+                        busy={busy}
+                        onClick={() => setStatus(user.id, "suspended")}
+                      />
+                    )}
+                    {user.role === "user" ? (
+                      <Action
+                        icon={ShieldCheck}
+                        label="Make administrator"
+                        busy={busy}
+                        onClick={() => setRole(user.id, "admin")}
+                      />
+                    ) : (
+                      !isSelf && (
+                        <Action
+                          icon={ShieldOff}
+                          label="Remove administrator"
                           busy={busy}
-                          onClick={() => setEditing(user)}
-                          title="Choose what this account may do"
-                        >
-                          <SlidersHorizontal className="h-3.5 w-3.5" />
-                        </Button>
-                        {user.status !== "active" && (
-                          <Button
-                            variant="ghost"
-                            busy={busy}
-                            onClick={() => setStatus(user.id, "active")}
-                            title="Allow this account to sign in"
-                          >
-                            <Check className="h-3.5 w-3.5" />
-                            Approve
-                          </Button>
-                        )}
-                        {user.status === "active" && !isSelf && (
-                          <Button
-                            variant="ghost"
-                            busy={busy}
-                            onClick={() => setStatus(user.id, "suspended")}
-                            title="Revoke access immediately"
-                          >
-                            <Ban className="h-3.5 w-3.5" />
-                            Suspend
-                          </Button>
-                        )}
-                        {user.role === "user" ? (
-                          <Button
-                            variant="ghost"
-                            busy={busy}
-                            onClick={() => setRole(user.id, "admin")}
-                            title="Grant administrator access"
-                          >
-                            <ShieldCheck className="h-3.5 w-3.5" />
-                          </Button>
-                        ) : (
-                          !isSelf && (
-                            <Button
-                              variant="ghost"
-                              busy={busy}
-                              onClick={() => setRole(user.id, "user")}
-                              title="Revoke administrator access"
-                            >
-                              <ShieldOff className="h-3.5 w-3.5" />
-                            </Button>
-                          )
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+                          onClick={() => setRole(user.id, "user")}
+                        />
+                      )
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </Card>
 
       {editing && (
@@ -214,15 +246,22 @@ export function Admin({ me }: { me: User }) {
         <h2 className="mb-2 text-sm font-semibold text-ink">Recent activity</h2>
         <Card className="divide-y divide-border-soft">
           {audit.length === 0 && (
-            <p className="px-4 py-6 text-sm text-ink-faint">Nothing yet.</p>
+            <p className="px-4 py-8 text-center text-sm text-ink-faint">
+              Nothing yet.
+            </p>
           )}
           {audit.map((entry) => (
             <div
               key={entry.id}
-              className="flex items-baseline justify-between gap-4 px-4 py-2.5 text-sm"
+              className="flex items-center justify-between gap-4 px-4 py-2.5"
             >
-              <span className="font-mono text-xs text-ink-muted">
-                {entry.action}
+              <span className="flex min-w-0 items-center gap-2">
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotFor(entry.action)}`}
+                />
+                <span className="truncate text-sm text-ink-muted">
+                  {describe(entry.action)}
+                </span>
               </span>
               <span className="shrink-0 text-xs text-ink-faint">
                 {new Date(entry.created_at).toLocaleString()}
@@ -233,4 +272,122 @@ export function Admin({ me }: { me: User }) {
       </section>
     </div>
   );
+}
+
+function Stat({
+  icon: Icon,
+  label,
+  value,
+  tone,
+}: {
+  icon: typeof Users;
+  label: string;
+  value: number;
+  tone: "plain" | "warn";
+}) {
+  return (
+    <div
+      className={`rounded-[var(--radius-card)] border p-3 ${
+        tone === "warn" && value > 0
+          ? "border-[var(--color-warn)]/30 bg-warn-soft"
+          : "border-border bg-raised"
+      }`}
+    >
+      <Icon
+        className={`mb-2 h-4 w-4 ${
+          tone === "warn" && value > 0 ? "text-warn" : "text-ink-faint"
+        }`}
+      />
+      <p className="text-xl font-semibold tabular-nums text-ink">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{label}</p>
+    </div>
+  );
+}
+
+/// Initial on a colour derived from the address.
+///
+/// Deterministic rather than random so the same person keeps the same
+/// colour between loads, which is what makes a list scannable at all.
+function Avatar({ email }: { email: string }) {
+  const palette = [
+    "#2d7ff9",
+    "#1a8a52",
+    "#b06a00",
+    "#d4493b",
+    "#7c4dff",
+    "#0097a7",
+  ];
+  let hash = 0;
+  for (const char of email) hash = (hash * 31 + char.charCodeAt(0)) | 0;
+  const colour = palette[Math.abs(hash) % palette.length];
+
+  return (
+    <span
+      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white"
+      style={{ backgroundColor: colour }}
+      aria-hidden
+    >
+      {email[0]?.toUpperCase() ?? "?"}
+    </span>
+  );
+}
+
+function Action({
+  icon: Icon,
+  label,
+  busy,
+  danger = false,
+  onClick,
+}: {
+  icon: typeof Ban;
+  label: string;
+  busy: boolean;
+  danger?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      title={label}
+      aria-label={label}
+      className={`rounded-[var(--radius-control)] border border-border p-2 transition-colors
+                  disabled:opacity-40 ${
+                    danger
+                      ? "text-ink-faint hover:bg-[var(--color-danger-soft)] hover:text-[var(--color-danger)]"
+                      : "text-ink-faint hover:bg-surface hover:text-ink"
+                  }`}
+    >
+      <Icon className="h-3.5 w-3.5" />
+    </button>
+  );
+}
+
+/// Audit actions are machine names; this renders them as English.
+function describe(action: string): string {
+  const map: Record<string, string> = {
+    "user.register": "An account was created",
+    "user.login": "Someone signed in",
+    "user.login_failed": "A sign-in was refused",
+    "user.password_changed": "A password was changed",
+    "admin.set_status": "An account's access was changed",
+    "admin.set_permissions": "Permissions were changed",
+    "admin.set_role": "An administrator role was changed",
+    "telegram.connected": "A Telegram account was linked",
+    "telegram.disconnect": "A Telegram account was unlinked",
+    "share.created": "A share link was created",
+    "share.revoked": "A share link was revoked",
+    "share.offline_enabled": "Offline sharing was turned on",
+    "share.offline_disabled": "Offline sharing was turned off",
+  };
+  return map[action] ?? action;
+}
+
+function dotFor(action: string): string {
+  if (action.includes("failed") || action.includes("revoked"))
+    return "bg-[var(--color-danger)]";
+  if (action.startsWith("admin.")) return "bg-[var(--color-warn)]";
+  if (action.includes("connected") || action.includes("register"))
+    return "bg-[var(--color-success)]";
+  return "bg-[var(--color-ink-faint)]";
 }

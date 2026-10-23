@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Monitor, Moon, Sun, X } from "lucide-react";
+import { Check, Monitor, Moon, RotateCcw, Sun, X } from "lucide-react";
 import { api, ApiError } from "../api";
 import { applyTheme, loadTheme, type Theme } from "../theme";
+import { applyPreset, loadPreset, PRESETS } from "../themes";
 import { Alert, Button, Card, PasswordField } from "../ui";
 
 /// Settings that belong to the person, not to a file.
@@ -16,6 +17,7 @@ export function Preferences({
   onClose: () => void;
 }) {
   const [theme, setTheme] = useState<Theme>(loadTheme);
+  const [preset, setPreset] = useState<string | null>(loadPreset);
   const [offline, setOffline] = useState<boolean | null>(null);
   const [offlineAvailable, setOfflineAvailable] = useState(false);
   const [password, setPassword] = useState("");
@@ -37,6 +39,15 @@ export function Preferences({
   function choose(next: Theme) {
     setTheme(next);
     applyTheme(next);
+  }
+
+  /// Presets and the light/dark switch are mutually exclusive: a preset
+  /// fixes every colour, so leaving "System" highlighted underneath it
+  /// would claim the app still follows the device when it does not.
+  function pick(id: string | null) {
+    setPreset(id);
+    applyPreset(id);
+    if (id === null) applyTheme(theme);
   }
 
   async function setOfflineSharing(enabled: boolean) {
@@ -118,7 +129,7 @@ export function Preferences({
                   onClick={() => choose(value)}
                   className={`flex flex-col items-center gap-1.5 rounded-[var(--radius-control)]
                               border px-3 py-3 text-xs transition-colors ${
-                                theme === value
+                                preset === null && theme === value
                                   ? "border-accent bg-accent-soft text-accent"
                                   : "border-border text-ink-muted hover:bg-surface hover:text-ink"
                               }`}
@@ -128,6 +139,61 @@ export function Preferences({
                 </button>
               ))}
             </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-ink-faint">
+              System follows your device. A preset below overrides this.
+            </p>
+          </section>
+
+          <section className="mb-5">
+            <h3 className="mb-2 text-xs font-medium text-ink-muted">Presets</h3>
+            <div className="grid grid-cols-2 gap-2">
+              {PRESETS.map((item) => (
+                <button
+                  key={item.id}
+                  onClick={() => pick(item.id)}
+                  className={`overflow-hidden rounded-[var(--radius-control)] border text-left
+                              transition-colors ${
+                                preset === item.id
+                                  ? "border-accent ring-1 ring-accent"
+                                  : "border-border hover:border-accent/40"
+                              }`}
+                >
+                  {/* Three bands: ground, raised, accent — the same way
+                      the desktop app previews a theme, so a palette can
+                      be judged without applying it. */}
+                  <span className="flex h-10 w-full">
+                    <span
+                      className="h-full flex-1"
+                      style={{ backgroundColor: item.swatch[0] }}
+                    />
+                    <span
+                      className="h-full flex-1"
+                      style={{ backgroundColor: item.swatch[1] }}
+                    />
+                    <span
+                      className="h-full w-1/3"
+                      style={{ backgroundColor: item.swatch[2] }}
+                    />
+                  </span>
+                  <span className="flex items-center justify-between px-2.5 py-1.5">
+                    <span className="truncate text-xs text-ink">{item.name}</span>
+                    {preset === item.id && (
+                      <Check className="h-3 w-3 shrink-0 text-accent" />
+                    )}
+                  </span>
+                </button>
+              ))}
+            </div>
+            {preset && (
+              <Button
+                variant="ghost"
+                onClick={() => pick(null)}
+                className="mt-2 w-full"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                Back to the standard theme
+              </Button>
+            )}
           </section>
 
           <section className="mb-5 border-t border-border-soft pt-4">
