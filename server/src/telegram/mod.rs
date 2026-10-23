@@ -130,6 +130,19 @@ pub struct Pending {
 #[derive(Default)]
 pub struct PendingLogins {
     inner: Mutex<HashMap<Uuid, Pending>>,
+    /// Users with a poll currently running.
+    ///
+    /// A QR poll removes the entry while it talks to Telegram, which can
+    /// take seconds when a scan triggers a datacenter handshake. The
+    /// browser polls on a fixed timer and does not know that, so a second
+    /// poll arrives mid-handshake, finds the map empty, and reports the
+    /// sign-in expired — cancelling a login that was about to succeed.
+    /// This lets the overlapping poll answer "still waiting" instead.
+    ///
+    /// A std mutex rather than tokio's: it is only ever held for a set
+    /// insert or remove, never across an await, and a synchronous lock is
+    /// what lets the guard below release itself in `Drop`.
+    polling: std::sync::Mutex<std::collections::HashSet<Uuid>>,
 }
 
 impl PendingLogins {
@@ -165,6 +178,23 @@ impl PendingLogins {
         let removed = self.inner.lock().await.remove(&user);
         if let Some(pending) = removed {
             pending.connection.close().await;
+        }
+    }
+
+    /// Marks a poll as running, or reports that one already is.
+    ///
+    /// Returns `false` when another poll holds the slot, which the caller
+    /// should treat as "still waiting" rather than an error.
+    pub fn begin_poll(&self, user: Uuid) -> bool {
+        self.polling
+            .lock()
+            .map(|mut set| set.insert(user))
+            .unwrap_or(true)
+    }
+
+    pub fn end_poll(&self, user: Uuid) {
+        if let Ok(mut set) = self.polling.lock() {
+            set.remove(&user);
         }
     }
 

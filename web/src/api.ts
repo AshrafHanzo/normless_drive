@@ -93,6 +93,14 @@ export class ApiError extends Error {
   get isAuthProblem() {
     return this.status === 401;
   }
+
+  /// The cookie is still valid but the server cannot decrypt this user's
+  /// Telegram session — its key lives only in memory and is lost on
+  /// restart. Signing in again is the one thing that fixes it, so the UI
+  /// says so rather than showing a generic refusal.
+  get isLocked() {
+    return this.code === "SESSION_LOCKED";
+  }
 }
 
 async function request<T>(

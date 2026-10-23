@@ -80,7 +80,7 @@ pub async fn connection_for(
         .ok_or(ApiError::Unauthenticated)?;
     let key = keys
         .get(&hash_session_token(cookie.value()))
-        .ok_or_else(|| ApiError::Forbidden(TelegramError::Locked.to_string()))?;
+        .ok_or(ApiError::SessionLocked)?;
 
     clients
         .get(user.id, &key, pool)

@@ -62,9 +62,7 @@ fn wrapping_key(
         .cookie(SESSION_COOKIE)
         .ok_or(ApiError::Unauthenticated)?;
     let hash = hash_session_token(cookie.value());
-    let key = keys.get(&hash).ok_or_else(|| {
-        ApiError::Forbidden("Please sign in again to unlock your Telegram connection.".into())
-    })?;
+    let key = keys.get(&hash).ok_or(ApiError::SessionLocked)?;
     Ok((hash, key))
 }
 
@@ -270,6 +268,30 @@ async fn qr_poll(
     pending: web::Data<SharedPending>,
     pool: web::Data<Db>,
     keys: web::Data<KeyCache>,
+) -> ApiResult<HttpResponse> {
+    // A scan triggers a datacenter handshake that can take seconds. The
+    // browser keeps polling on its timer regardless, and without this the
+    // overlapping poll finds the entry checked out and declares the
+    // sign-in expired — cancelling one that was about to succeed.
+    if !pending.begin_poll(user.id) {
+        return Ok(HttpResponse::Ok().json(QrResponse {
+            url: None,
+            expires: None,
+            connected: false,
+        }));
+    }
+
+    let outcome = qr_poll_inner(&request, &user, &pending, &pool, &keys).await;
+    pending.end_poll(user.id);
+    outcome
+}
+
+async fn qr_poll_inner(
+    request: &HttpRequest,
+    user: &CurrentUser,
+    pending: &SharedPending,
+    pool: &Db,
+    keys: &KeyCache,
 ) -> ApiResult<HttpResponse> {
     let entry = pending.take(user.id).await.ok_or_else(|| {
         ApiError::BadRequest("That sign-in expired. Show a new QR code.".into())

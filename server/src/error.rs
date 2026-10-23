@@ -21,6 +21,18 @@ pub enum ApiError {
     #[error("{0}")]
     Forbidden(String),
 
+    /// Signed in, but the key that decrypts this user's Telegram session
+    /// is not in memory.
+    ///
+    /// Happens after every server restart, because the key is derived at
+    /// login and deliberately never written to disk. The browser still
+    /// holds a valid cookie, so the user looks signed in and everything
+    /// Telegram-related fails with no obvious cause. Distinct from
+    /// `Forbidden` so the UI can recognise it and offer the one action
+    /// that fixes it rather than showing a dead end.
+    #[error("Your session needs unlocking. Please sign in again.")]
+    SessionLocked,
+
     #[error("{0}")]
     NotFound(String),
 
@@ -72,6 +84,7 @@ impl ApiError {
             ApiError::BadRequest(_) => "BAD_REQUEST",
             ApiError::Unauthenticated => "UNAUTHENTICATED",
             ApiError::Forbidden(_) => "FORBIDDEN",
+            ApiError::SessionLocked => "SESSION_LOCKED",
             ApiError::NotFound(_) => "NOT_FOUND",
             ApiError::Conflict(_) => "CONFLICT",
             ApiError::Internal(_) => "INTERNAL",
@@ -85,6 +98,7 @@ impl ResponseError for ApiError {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthenticated => StatusCode::UNAUTHORIZED,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::SessionLocked => StatusCode::FORBIDDEN,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
