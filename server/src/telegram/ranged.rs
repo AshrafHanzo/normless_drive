@@ -94,6 +94,27 @@ pub fn parse(raw: Option<&str>, size: u64) -> Requested {
     Requested::Part(Span { start, end })
 }
 
+/// Trims one downloaded chunk down to the part that was actually asked for.
+///
+/// Reads start at a chunk boundary, so the first chunk carries bytes before
+/// the requested range and the last carries bytes after it. `None` means
+/// this chunk lies entirely before the range and nothing should be sent.
+fn splice(mut chunk: Vec<u8>, drop_prefix: &mut usize, remaining: &mut u64) -> Option<Vec<u8>> {
+    if *drop_prefix > 0 {
+        if *drop_prefix >= chunk.len() {
+            *drop_prefix -= chunk.len();
+            return None;
+        }
+        chunk.drain(..*drop_prefix);
+        *drop_prefix = 0;
+    }
+    if chunk.len() as u64 > *remaining {
+        chunk.truncate(*remaining as usize);
+    }
+    *remaining -= chunk.len() as u64;
+    Some(chunk)
+}
+
 /// Streams `length` bytes starting at `start`, pulling from Telegram.
 fn body(
     client: Client,
@@ -116,20 +137,10 @@ fn body(
 
         while remaining > 0 {
             match chunks.next().await {
-                Ok(Some(mut chunk)) => {
-                    if drop_prefix > 0 {
-                        if drop_prefix >= chunk.len() {
-                            drop_prefix -= chunk.len();
-                            continue;
-                        }
-                        chunk.drain(..drop_prefix);
-                        drop_prefix = 0;
+                Ok(Some(chunk)) => {
+                    if let Some(wanted) = splice(chunk, &mut drop_prefix, &mut remaining) {
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(wanted));
                     }
-                    if chunk.len() as u64 > remaining {
-                        chunk.truncate(remaining as usize);
-                    }
-                    remaining -= chunk.len() as u64;
-                    yield Ok::<_, actix_web::Error>(web::Bytes::from(chunk));
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -196,10 +207,55 @@ pub fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Requested, Span};
+    use super::{parse, splice, Requested, Span, CHUNK};
 
     fn part(start: u64, end: u64) -> Requested {
         Requested::Part(Span { start, end })
+    }
+
+    /// Replays what the stream does: whole chunks arrive from a given
+    /// boundary, and only the asked-for window should come out.
+    fn served(file: &[u8], start: u64, length: u64) -> Vec<u8> {
+        let chunk = 8usize; // stands in for CHUNK, small enough to read
+        let mut drop_prefix = (start % chunk as u64) as usize;
+        let mut remaining = length;
+        let mut out = Vec::new();
+
+        let mut at = (start / chunk as u64) as usize * chunk;
+        while remaining > 0 && at < file.len() {
+            let end = (at + chunk).min(file.len());
+            if let Some(part) = splice(file[at..end].to_vec(), &mut drop_prefix, &mut remaining) {
+                out.extend_from_slice(&part);
+            }
+            at = end;
+        }
+        out
+    }
+
+    #[test]
+    fn a_range_is_cut_out_of_the_chunks_that_contain_it() {
+        let file: Vec<u8> = (0u8..=99).collect();
+
+        // Whole file.
+        assert_eq!(served(&file, 0, 100), file);
+        // Starting mid-chunk, ending mid-chunk.
+        assert_eq!(served(&file, 3, 10), file[3..13]);
+        // A window that skips several chunks before it begins.
+        assert_eq!(served(&file, 41, 7), file[41..48]);
+        // Exactly on boundaries.
+        assert_eq!(served(&file, 8, 8), file[8..16]);
+        // The tail, which is how a zip's index is read.
+        assert_eq!(served(&file, 95, 5), file[95..]);
+        // One byte.
+        assert_eq!(served(&file, 50, 1), file[50..51]);
+    }
+
+    #[test]
+    fn the_chunk_size_is_one_telegram_will_accept() {
+        // Its API wants a multiple of 4 KiB that never straddles a 1 MiB
+        // boundary; both follow from this and it must stay true.
+        assert_eq!(CHUNK % 4096, 0);
+        assert_eq!(1024 * 1024 % CHUNK, 0);
     }
 
     #[test]
