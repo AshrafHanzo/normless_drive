@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { Download, HardDrive, Lock } from "lucide-react";
+import { Download, FolderOpen, HardDrive, Lock } from "lucide-react";
 import { api, ApiError, type FileRow, type SharePermissions } from "../api";
+import { formatSize } from "../paths";
 import { Alert, Button, Card, PasswordField, Spinner } from "../ui";
+import { ZipViewer } from "./ZipViewer";
 
 /// What someone who was handed a link sees.
 ///
@@ -28,6 +30,7 @@ export function PublicShare({ token }: { token: string }) {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [viewing, setViewing] = useState<FileRow | null>(null);
 
   const open = useCallback(async () => {
     try {
@@ -181,6 +184,20 @@ export function PublicShare({ token }: { token: string }) {
                         {formatSize(file.size)}
                       </p>
                     </div>
+                    {/* A shared folder that arrived as one archive would
+                        otherwise be all-or-nothing for whoever got the
+                        link. */}
+                    {isArchive(file) && (
+                      <button
+                        onClick={() => setViewing(file)}
+                        className="flex items-center gap-1.5 rounded-[var(--radius-control)]
+                                   border border-border px-2.5 py-1.5 text-xs text-ink-muted
+                                   transition-colors hover:bg-surface hover:text-ink"
+                      >
+                        <FolderOpen className="h-3.5 w-3.5" />
+                        Look inside
+                      </button>
+                    )}
                     <a
                       href={api.publicShare.downloadUrl(token, file.id)}
                       className="flex items-center gap-1.5 rounded-[var(--radius-control)]
@@ -197,7 +214,23 @@ export function PublicShare({ token }: { token: string }) {
           </>
         )}
       </div>
+
+      {viewing && (
+        <ZipViewer
+          url={api.publicShare.downloadUrl(token, viewing.id)}
+          name={viewing.name}
+          size={viewing.size}
+          onClose={() => setViewing(null)}
+        />
+      )}
     </div>
+  );
+}
+
+function isArchive(file: FileRow) {
+  return (
+    file.name.toLowerCase().endsWith(".zip") ||
+    file.mime_type === "application/zip"
   );
 }
 
@@ -210,13 +243,3 @@ function describe(permissions: SharePermissions) {
   return allowed.length ? `You can ${allowed.join(" and ")}.` : "Read only.";
 }
 
-function formatSize(bytes: number) {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit++;
-  }
-  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
-}

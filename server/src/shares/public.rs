@@ -6,7 +6,6 @@
 
 use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use grammers_client::types::Media;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -409,29 +408,22 @@ async fn download(
             .collect::<String>()
     );
 
-    let media = Media::Document(document);
-    let client = connection.client.clone();
-    let stream = async_stream::stream! {
-        let mut chunks = client.iter_download(&media);
-        loop {
-            match chunks.next().await {
-                Ok(Some(chunk)) => yield Ok::<_, actix_web::Error>(web::Bytes::from(chunk)),
-                Ok(None) => break,
-                Err(error) => {
-                    tracing::warn!(?error, message_id, "share download failed mid-transfer");
-                    break;
-                }
-            }
-        }
-    };
+    // Counted once, on the request that starts the transfer. A ranged read
+    // is part of the same download — the archive viewer makes several per
+    // file — so only the opening request bumps the counter.
+    if request.headers().get(actix_web::http::header::RANGE).is_none() {
+        touch(&pool, share.id).await;
+    }
 
-    touch(&pool, share.id).await;
-
-    Ok(HttpResponse::Ok()
-        .content_type(mime)
-        .insert_header((actix_web::http::header::CONTENT_DISPOSITION, disposition))
-        .insert_header((actix_web::http::header::CONTENT_LENGTH, size.to_string()))
-        .streaming(Box::pin(stream)))
+    Ok(crate::telegram::ranged::serve(
+        &request,
+        connection.client.clone(),
+        Media::Document(document),
+        size,
+        mime,
+        disposition,
+        message_id,
+    ))
 }
 
 /// Records that a link was used. Best effort: a failed counter update must

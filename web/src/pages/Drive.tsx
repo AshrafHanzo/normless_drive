@@ -6,6 +6,7 @@ import {
   FileText,
   FileVideo,
   File as FileIcon,
+  FolderOpen,
   FolderUp,
   Globe,
   Inbox,
@@ -36,16 +37,23 @@ import { NewGroup } from "./NewGroup";
 import { Sidebar } from "./Sidebar";
 import { UploadQueue, type QueueItem } from "./UploadQueue";
 import {
-  folderNameOf,
-  loadZipPreference,
-  relativePathOf,
-  // Aliased: Drive already has a 	otalBytes memo for the folder's own
+  flatten,
+  // Aliased: Drive already has a totalBytes memo for the folder's own
   // size, and the collision silently shadowed this function.
   totalBytes as sumFileSizes,
   zipFolder,
-  ZIP_LIMIT_BYTES,
+  type UploadMode,
 } from "../folderUpload";
+import {
+  fromInput,
+  pickDirectory,
+  supportsDirectoryHandle,
+  type Picked,
+} from "../folderPick";
+import { formatSize } from "../paths";
+import { FolderReview } from "./FolderReview";
 import { ShareDialog } from "./ShareDialog";
+import { ZipViewer } from "./ZipViewer";
 
 type View = "list" | "grid";
 
@@ -80,6 +88,9 @@ export function Drive({
   const [newGroup, setNewGroup] = useState(false);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [picked, setPicked] = useState<Picked | null>(null);
+  const [picking, setPicking] = useState(false);
+  const [viewing, setViewing] = useState<FileRow | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
   const picker = useRef<HTMLInputElement>(null);
   const folderPicker = useRef<HTMLInputElement>(null);
@@ -197,66 +208,84 @@ export function Drive({
     await load(folder);
   }
 
-  /// Uploads a picked directory, either as one archive or file by file.
-  async function sendFolder(files: File[]) {
-    if (files.length === 0) return;
-
-    const name = folderNameOf(files);
-    const bytes = sumFileSizes(files);
-
-    if (loadZipPreference()) {
-      if (bytes > ZIP_LIMIT_BYTES) {
-        setError(
-          `That folder is ${(bytes / 1_000_000_000).toFixed(1)} GB. Zipping happens in your browser's memory, which will not hold that — turn off "Zip folders before upload" in Preferences to send the files individually instead.`,
-        );
-        return;
-      }
-
-      setUploading(true);
-      setError(null);
-      // Zipping a large folder takes a while with nothing else to show
-      // for it, so the queue gets an entry immediately rather than the
-      // page looking frozen.
-      setQueue([
-        {
-          id: "zip",
-          name: `${name}.zip`,
-          size: bytes,
-          state: "uploading",
-        },
-      ]);
-
-      try {
-        const archive = await zipFolder(files);
-        setQueue([
-          { id: "zip", name: archive.name, size: archive.size, state: "uploading" },
-        ]);
-        await api.files.upload(archive, folder);
-        setQueue([
-          { id: "zip", name: archive.name, size: archive.size, state: "done" },
-        ]);
-      } catch (caught) {
-        const message =
-          caught instanceof ApiError ? caught.message : "Could not zip that folder.";
-        setQueue([
-          { id: "zip", name: `${name}.zip`, size: bytes, state: "failed", error: message },
-        ]);
-      } finally {
-        setUploading(false);
-        if (folderPicker.current) folderPicker.current.value = "";
-        await load(folder);
-      }
+  /// Opens the folder picker and reads the tree, without sending anything.
+  ///
+  /// Where the File System Access API exists the browser asks to *view* the
+  /// folder — one calm question — instead of "Upload 57 files to this
+  /// site?". Everywhere else the hidden input is used and that prompt is
+  /// the browser's to show, not ours to style. Either way the decision to
+  /// upload is taken afterwards, in the review dialog.
+  async function openFolder() {
+    setError(null);
+    if (!supportsDirectoryHandle()) {
+      folderPicker.current?.click();
       return;
     }
 
-    // Individual mode: the path inside the folder becomes the file name,
-    // the same convention the desktop app's backup uses, so a nested tree
-    // survives in a flat Telegram channel and is rebuildable from the
-    // names alone.
-    const renamed = files.map(
-      (file) => new File([file], relativePathOf(file), { type: file.type }),
-    );
-    await send(renamed);
+    setPicking(true);
+    try {
+      const result = await pickDirectory((count) =>
+        setProgress(`Reading the folder… ${count.toLocaleString()} files so far`),
+      );
+      if (result && result.files.length > 0) setPicked(result);
+      else if (result) setError("That folder has no files in it.");
+    } catch (caught) {
+      setError(
+        caught instanceof Error ? caught.message : "Could not read that folder.",
+      );
+    } finally {
+      setPicking(false);
+      setProgress(null);
+    }
+  }
+
+  /// Uploads a reviewed directory, either as one archive or file by file.
+  async function sendFolder(chosen: Picked, mode: UploadMode) {
+    setPicked(null);
+    if (folderPicker.current) folderPicker.current.value = "";
+
+    if (mode === "individual") {
+      await send(flatten(chosen));
+      return;
+    }
+
+    const bytes = sumFileSizes(chosen.files);
+    setUploading(true);
+    setError(null);
+    // Zipping a large folder takes a while with nothing else to show for
+    // it, so the queue gets an entry immediately rather than the page
+    // looking frozen.
+    setQueue([
+      { id: "zip", name: `${chosen.name}.zip`, size: bytes, state: "uploading" },
+    ]);
+
+    try {
+      const archive = await zipFolder(chosen, (done, total) => {
+        // Throttled: a render per file would be thousands of them for no
+        // extra information.
+        if (done % 25 === 0 || done === total) {
+          setProgress(`Compressing… ${done.toLocaleString()} of ${total.toLocaleString()}`);
+        }
+      });
+      setProgress(null);
+      setQueue([
+        { id: "zip", name: archive.name, size: archive.size, state: "uploading" },
+      ]);
+      await api.files.upload(archive, folder);
+      setQueue([
+        { id: "zip", name: archive.name, size: archive.size, state: "done" },
+      ]);
+    } catch (caught) {
+      const message =
+        caught instanceof ApiError ? caught.message : "Could not zip that folder.";
+      setQueue([
+        { id: "zip", name: `${chosen.name}.zip`, size: bytes, state: "failed", error: message },
+      ]);
+    } finally {
+      setProgress(null);
+      setUploading(false);
+      await load(folder);
+    }
   }
 
   async function syncFolders() {
@@ -379,8 +408,8 @@ export function Drive({
 
             <Button
               variant="ghost"
-              busy={uploading}
-              onClick={() => folderPicker.current?.click()}
+              busy={uploading || picking}
+              onClick={() => void openFolder()}
               title="Upload a whole folder"
             >
               <FolderUp className="h-3.5 w-3.5" />
@@ -403,35 +432,22 @@ export function Drive({
               }}
             />
             <input
-
               ref={folderPicker}
-
               type="file"
-
-              // Non-standard but universally supported, and the only way a
-
-              // browser will offer a directory picker at all.
-
+              // The fallback for Firefox and Safari, which have no File
+              // System Access API. Non-standard, but the only way those
+              // browsers will offer a directory picker at all.
               // @ts-expect-error -- not in React's typings
-
               webkitdirectory=""
-
               directory=""
-
               multiple
-
               hidden
-
               onChange={(e) => {
-
-                const chosen = Array.from(e.target.files ?? []);
-
-                if (chosen.length) void sendFolder(chosen);
-
+                const chosen = fromInput(e.target.files);
+                if (chosen) setPicked(chosen);
               }}
-
             />
-</div>
+          </div>
         </header>
 
         <main className="relative flex-1 overflow-y-auto p-4">
@@ -511,6 +527,7 @@ export function Drive({
                   folder={folder}
                   checked={selected.has(file.id)}
                   onToggle={() => toggle(file.id)}
+                  onOpen={isArchive(file) ? () => setViewing(file) : undefined}
                   onDeleted={() => void load(folder)}
                 />
               ))}
@@ -522,6 +539,7 @@ export function Drive({
                   key={file.id}
                   file={file}
                   folder={folder}
+                  onOpen={isArchive(file) ? () => setViewing(file) : undefined}
                   onDeleted={() => void load(folder)}
                 />
               ))}
@@ -547,6 +565,25 @@ export function Drive({
             void loadFolders();
             setFolder(id);
           }}
+        />
+      )}
+      {picked && (
+        <FolderReview
+          picked={picked}
+          busy={uploading}
+          onCancel={() => {
+            setPicked(null);
+            if (folderPicker.current) folderPicker.current.value = "";
+          }}
+          onConfirm={(mode) => void sendFolder(picked, mode)}
+        />
+      )}
+      {viewing && (
+        <ZipViewer
+          url={api.files.downloadUrl(viewing.id, folder)}
+          name={viewing.name}
+          size={viewing.size}
+          onClose={() => setViewing(null)}
         />
       )}
       {prefs && <Preferences phoneHint={phoneHint} onClose={() => setPrefs(false)} />}
@@ -671,12 +708,15 @@ function ListRow({
   folder,
   checked,
   onToggle,
+  onOpen,
   onDeleted,
 }: {
   file: FileRow;
   folder: string | undefined;
   checked: boolean;
   onToggle: () => void;
+  /// Present only for a zip, which can be browsed in place.
+  onOpen?: () => void;
   onDeleted: () => void;
 }) {
   const Icon = iconFor(file.mime_type, file.name);
@@ -693,15 +733,35 @@ function ListRow({
       />
       <Icon className="h-4 w-4 shrink-0 text-ink-faint" />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm text-ink" title={file.name}>
-          {file.name}
-        </p>
+        {onOpen ? (
+          <button
+            onClick={onOpen}
+            title="Look inside this archive"
+            className="block max-w-full truncate text-left text-sm text-ink hover:text-accent hover:underline"
+          >
+            {file.name}
+          </button>
+        ) : (
+          <p className="truncate text-sm text-ink" title={file.name}>
+            {file.name}
+          </p>
+        )}
       </div>
       <span className="shrink-0 text-xs text-ink-faint">{formatSize(file.size)}</span>
       <span className="hidden shrink-0 text-xs text-ink-faint sm:inline">
         {new Date(file.date * 1000).toLocaleDateString()}
       </span>
       <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+        {onOpen && (
+          <button
+            onClick={onOpen}
+            title="Look inside"
+            aria-label={`Look inside ${file.name}`}
+            className="rounded-[var(--radius-control)] p-1.5 text-ink-faint hover:bg-canvas hover:text-ink"
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+          </button>
+        )}
         <a
           href={api.files.downloadUrl(file.id, folder)}
           title="Download"
@@ -727,10 +787,12 @@ function ListRow({
 function GridCard({
   file,
   folder,
+  onOpen,
   onDeleted,
 }: {
   file: FileRow;
   folder: string | undefined;
+  onOpen?: () => void;
   onDeleted: () => void;
 }) {
   const Icon = iconFor(file.mime_type, file.name);
@@ -755,15 +817,36 @@ function GridCard({
         {file.name}
       </p>
       <p className="mt-0.5 text-[11px] text-ink-faint">{formatSize(file.size)}</p>
-      <a
-        href={api.files.downloadUrl(file.id, folder)}
-        className="mt-3 w-full rounded-[var(--radius-control)] border border-border py-1
-                   text-center text-[11px] text-ink-muted transition-colors
-                   hover:bg-surface hover:text-ink"
-      >
-        Download
-      </a>
+      <div className="mt-3 flex w-full gap-1">
+        {onOpen && (
+          <button
+            onClick={onOpen}
+            className="flex-1 rounded-[var(--radius-control)] border border-border py-1
+                       text-center text-[11px] text-ink-muted transition-colors
+                       hover:bg-surface hover:text-ink"
+          >
+            Open
+          </button>
+        )}
+        <a
+          href={api.files.downloadUrl(file.id, folder)}
+          className="flex-1 rounded-[var(--radius-control)] border border-border py-1
+                     text-center text-[11px] text-ink-muted transition-colors
+                     hover:bg-surface hover:text-ink"
+        >
+          Download
+        </a>
+      </div>
     </div>
+  );
+}
+
+/// Only zip: the viewer reads the zip format specifically, and offering to
+/// open a .rar it cannot read would be a worse answer than not offering.
+function isArchive(file: FileRow) {
+  return (
+    file.name.toLowerCase().endsWith(".zip") ||
+    file.mime_type === "application/zip"
   );
 }
 
@@ -776,15 +859,4 @@ function iconFor(mime: string | null, name: string) {
   if (type === "application/pdf" || ext === "pdf") return FileText;
   if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) return FileArchive;
   return FileIcon;
-}
-
-function formatSize(bytes: number) {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit++;
-  }
-  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }

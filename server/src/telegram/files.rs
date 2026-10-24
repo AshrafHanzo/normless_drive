@@ -12,7 +12,7 @@ use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures::StreamExt;
 use grammers_client::types::Media;
-use grammers_client::{Client, InputMessage};
+use grammers_client::InputMessage;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -172,35 +172,18 @@ async fn download(
     let size = document.size();
 
     // Streamed, not collected: a 2 GB file must not be assembled in memory
-    // before the first byte reaches the browser.
-    let media = Media::Document(document);
-    let client = connection.client.clone();
-    let stream = async_stream::stream! {
-        let mut chunks = client.iter_download(&media);
-        loop {
-            match chunks.next().await {
-                Ok(Some(chunk)) => yield Ok::<_, actix_web::Error>(web::Bytes::from(chunk)),
-                Ok(None) => break,
-                Err(error) => {
-                    // The response headers are already sent by now, so there
-                    // is no way to turn this into a clean HTTP error — the
-                    // transfer just ends short. Log it so the truncation is
-                    // explainable.
-                    tracing::warn!(?error, message_id, "download stream failed mid-transfer");
-                    break;
-                }
-            }
-        }
-    };
-
-    Ok(HttpResponse::Ok()
-        .content_type(mime)
-        .insert_header((
-            actix_web::http::header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}\"", sanitize_name(&name)),
-        ))
-        .insert_header((actix_web::http::header::CONTENT_LENGTH, size.to_string()))
-        .streaming(Box::pin(stream)))
+    // before the first byte reaches the browser. `serve` also answers a
+    // `Range` request, which is how the archive viewer reads a zip's index
+    // without pulling the archive down.
+    Ok(super::ranged::serve(
+        &request,
+        connection.client.clone(),
+        Media::Document(document),
+        size,
+        mime,
+        format!("attachment; filename=\"{}\"", sanitize_name(&name)),
+        message_id,
+    ))
 }
 
 async fn upload(

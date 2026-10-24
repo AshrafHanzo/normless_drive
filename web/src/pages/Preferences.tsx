@@ -207,8 +207,11 @@ export function Preferences({
                 </span>
                 <span className="mt-1 block text-xs leading-relaxed text-ink-faint">
                   {zipFolders
-                    ? "A folder becomes one .zip. Structure is kept exactly, but you must download the whole archive to get one file out of it."
+                    ? "A folder becomes one .zip, with its structure kept exactly. You can open the archive here afterwards and pull one file out of it."
                     : "Every file is uploaded separately, each one downloadable on its own, with its path kept in the name."}
+                  {" "}
+                  Only the starting point — each folder upload asks before it
+                  goes.
                 </span>
               </span>
               <input
