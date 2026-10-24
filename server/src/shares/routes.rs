@@ -39,6 +39,8 @@ pub struct ShareView {
     pub usage_limit: Option<i32>,
     pub usage_count: i32,
     pub allow_offline: bool,
+    /// How many individual files this link exposes; 0 means the folder.
+    pub file_count: usize,
     pub created_at: DateTime<Utc>,
 }
 
@@ -51,7 +53,8 @@ async fn list(
     let rows = client
         .query(
             "SELECT id, token, label, folder_id, permissions, password_hash,
-                    expires_at, usage_limit, usage_count, allow_offline, created_at
+                    expires_at, usage_limit, usage_count, allow_offline,
+                    message_ids, created_at
                FROM shares
               WHERE user_id = $1 AND NOT revoked
               ORDER BY created_at DESC",
@@ -77,6 +80,10 @@ async fn list(
                 usage_limit: row.get("usage_limit"),
                 usage_count: row.get("usage_count"),
                 allow_offline: row.get("allow_offline"),
+                file_count: row
+                    .get::<_, Option<Vec<i32>>>("message_ids")
+                    .map(|ids| ids.len())
+                    .unwrap_or(0),
                 created_at: row.get("created_at"),
             }
         })
@@ -98,6 +105,9 @@ pub struct CreateShare {
     pub usage_limit: Option<i32>,
     #[serde(default)]
     pub allow_offline: bool,
+    /// Specific files to expose. Empty or absent shares the whole folder.
+    #[serde(default)]
+    pub message_ids: Vec<i32>,
 }
 
 async fn create(
@@ -171,12 +181,21 @@ async fn create(
 
     let token = generate_token();
 
+    // An empty list means "the whole folder", stored as NULL so the
+    // public side can tell "no restriction" from "restricted to nothing"
+    // — the latter would be a link that shows no files at all.
+    let message_ids: Option<&[i32]> = if body.message_ids.is_empty() {
+        None
+    } else {
+        Some(&body.message_ids)
+    };
+
     let row = client
         .query_one(
             "INSERT INTO shares
                 (user_id, folder_id, token, permissions, password_hash,
-                 expires_at, usage_limit, label, allow_offline)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 expires_at, usage_limit, label, allow_offline, message_ids)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              RETURNING id, created_at",
             &[
                 &user.id,
@@ -188,6 +207,7 @@ async fn create(
                 &body.usage_limit,
                 &body.label,
                 &body.allow_offline,
+                &message_ids,
             ],
         )
         .await?;
@@ -217,6 +237,7 @@ async fn create(
         usage_limit: body.usage_limit,
         usage_count: 0,
         allow_offline: body.allow_offline,
+        file_count: body.message_ids.len(),
         created_at: row.get("created_at"),
     }))
 }

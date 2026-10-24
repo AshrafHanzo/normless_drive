@@ -10,11 +10,14 @@ import { Alert, Button, Card, Field, PasswordField, Spinner } from "../ui";
 export function ShareDialog({
   folderId,
   folderName,
+  messageIds,
   onClose,
   onFolderCreated,
 }: {
   folderId: string | undefined;
   folderName: string;
+  /// Files picked in the drive. Empty shares the whole folder.
+  messageIds: number[];
   onClose: () => void;
   onFolderCreated?: (id: string) => void;
 }) {
@@ -78,6 +81,9 @@ export function ShareDialog({
         label: label.trim() || undefined,
         folder_id: target,
         permissions,
+        // Only meaningful for an existing folder: a brand new one
+        // has no files to single out.
+        message_ids: mode === "existing" ? messageIds : [],
         password: password || undefined,
         expiry_hours: expiryHours ? Number(expiryHours) : undefined,
         usage_limit: usageLimit ? Number(usageLimit) : undefined,
@@ -159,7 +165,9 @@ export function ShareDialog({
                   : "border-border text-ink-muted hover:bg-surface hover:text-ink"
               }`}
             >
-              Share {folderName}
+              {messageIds.length > 0
+                ? `Share ${messageIds.length} selected file${messageIds.length === 1 ? "" : "s"}`
+                : `Share ${folderName}`}
             </button>
             <button
               onClick={() => setMode("new")}
@@ -339,6 +347,8 @@ function summarise(share: Share) {
     share.permissions.can_delete && "delete",
   ].filter(Boolean);
   parts.push(allowed.length ? allowed.join(" + ") : "no access");
+  if (share.file_count > 0)
+    parts.push(` file${share.file_count === 1 ? "" : "s"}`);
   if (share.has_password) parts.push("password");
   if (share.allow_offline) parts.push("works offline");
   if (share.expires_at)

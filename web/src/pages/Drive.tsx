@@ -33,6 +33,7 @@ import { RemoteUpload } from "./RemoteUpload";
 import { NewFolder } from "./NewFolder";
 import { NewGroup } from "./NewGroup";
 import { Sidebar } from "./Sidebar";
+import { UploadQueue, type QueueItem } from "./UploadQueue";
 import { ShareDialog } from "./ShareDialog";
 
 type View = "list" | "grid";
@@ -66,6 +67,8 @@ export function Drive({
   const [newFolder, setNewFolder] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [newGroup, setNewGroup] = useState(false);
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
   const [groups, setGroups] = useState<Group[]>([]);
   const picker = useRef<HTMLInputElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
@@ -106,25 +109,82 @@ export function Drive({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  async function send(file: File) {
+  /// Uploads a batch, one at a time.
+  ///
+  /// Sequential on purpose: every byte of every file crosses this server
+  /// on its way to Telegram, so running them in parallel does not make
+  /// the total any faster — it just makes each one slower and the
+  /// progress harder to read.
+  async function send(files: File[]) {
+    if (files.length === 0) return;
+
     setUploading(true);
     setError(null);
-    setProgress(`Uploading ${file.name}…`);
-    try {
-      await api.files.upload(file, folder);
-      await load(folder);
-      setProgress(null);
-    } catch (caught) {
-      setProgress(null);
-      setError(caught instanceof ApiError ? caught.message : "Upload failed.");
-    } finally {
-      setUploading(false);
-      if (picker.current) picker.current.value = "";
+    setQueue(
+      files.map((file, index) => ({
+        id: `${index}-${file.name}-${file.size}`,
+        name: file.name,
+        size: file.size,
+        state: "waiting" as const,
+      })),
+    );
+
+    for (const [index, file] of files.entries()) {
+      setQueue((current) =>
+        current.map((item, i) =>
+          i === index ? { ...item, state: "uploading" } : item,
+        ),
+      );
+      try {
+        await api.files.upload(file, folder);
+        setQueue((current) =>
+          current.map((item, i) =>
+            i === index ? { ...item, state: "done" } : item,
+          ),
+        );
+      } catch (caught) {
+        const message =
+          caught instanceof ApiError ? caught.message : "Upload failed.";
+        setQueue((current) =>
+          current.map((item, i) =>
+            i === index ? { ...item, state: "failed", error: message } : item,
+          ),
+        );
+      }
     }
+
+    setUploading(false);
+    if (picker.current) picker.current.value = "";
+    await load(folder);
   }
 
   /// Pulls in folders that exist in Telegram but not here — the ones made
   /// by the desktop app, which uses the same channel naming.
+  function toggle(id: number) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  }
+
+  async function deleteSelected() {
+    const ids = [...selected];
+    if (
+      !window.confirm(
+        `Delete ${ids.length} file${ids.length === 1 ? "" : "s"}? This removes them from Telegram permanently.`,
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    for (const id of ids) {
+      await api.files.remove(id, folder).catch(() => undefined);
+    }
+    setSelected(new Set());
+    await load(folder);
+  }
+
   async function syncFolders() {
     setSyncing(true);
     setError(null);
@@ -175,8 +235,8 @@ export function Drive({
       onDrop={(e) => {
         e.preventDefault();
         setDragging(false);
-        const dropped = e.dataTransfer.files?.[0];
-        if (dropped) void send(dropped);
+        const dropped = Array.from(e.dataTransfer.files ?? []);
+        if (dropped.length) void send(dropped);
       }}
     >
       {sidebarOpen && (
@@ -252,8 +312,8 @@ export function Drive({
               type="file"
               hidden
               onChange={(e) => {
-                const chosen = e.target.files?.[0];
-                if (chosen) void send(chosen);
+                const chosen = Array.from(e.target.files ?? []);
+                if (chosen.length) void send(chosen);
               }}
             />
           </div>
@@ -277,6 +337,29 @@ export function Drive({
             </div>
           )}
 
+          {/* Only appears once something is picked, so it costs nothing
+              the rest of the time. */}
+          {selected.size > 0 && (
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-[var(--radius-card)] border border-accent/40 bg-accent-soft px-3 py-2">
+              <span className="text-sm font-medium text-accent">
+                {selected.size} selected
+              </span>
+              <div className="ml-auto flex flex-wrap gap-1.5">
+                <Button variant="ghost" onClick={() => setSharing(true)}>
+                  <Share2 className="h-3.5 w-3.5" />
+                  Share these
+                </Button>
+                <Button variant="ghost" onClick={() => void deleteSelected()}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete
+                </Button>
+                <Button variant="ghost" onClick={() => setSelected(new Set())}>
+                  Clear
+                </Button>
+              </div>
+            </div>
+          )}
+
           {shown === null ? (
             <Spinner />
           ) : shown.length === 0 ? (
@@ -286,11 +369,33 @@ export function Drive({
             />
           ) : view === "list" ? (
             <div className="overflow-hidden rounded-[var(--radius-card)] border border-border bg-raised">
+              <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+                <input
+                  type="checkbox"
+                  aria-label="Select all files"
+                  checked={shown.length > 0 && selected.size === shown.length}
+                  onChange={(e) =>
+                    setSelected(
+                      e.target.checked
+                        ? new Set(shown.map((f) => f.id))
+                        : new Set(),
+                    )
+                  }
+                  className="h-3.5 w-3.5 accent-[var(--color-accent)]"
+                />
+                <span className="text-xs text-ink-faint">
+                  {selected.size > 0
+                    ? `${selected.size} of ${shown.length}`
+                    : "Select all"}
+                </span>
+              </div>
               {shown.map((file) => (
                 <ListRow
                   key={file.id}
                   file={file}
                   folder={folder}
+                  checked={selected.has(file.id)}
+                  onToggle={() => toggle(file.id)}
                   onDeleted={() => void load(folder)}
                 />
               ))}
@@ -321,6 +426,7 @@ export function Drive({
         <ShareDialog
           folderId={folder}
           folderName={activeName}
+          messageIds={[...selected]}
           onClose={() => setSharing(false)}
           onFolderCreated={(id) => {
             void loadFolders();
@@ -329,6 +435,8 @@ export function Drive({
         />
       )}
       {prefs && <Preferences phoneHint={phoneHint} onClose={() => setPrefs(false)} />}
+      <UploadQueue items={queue} onDismiss={() => setQueue([])} />
+
       {newGroup && (
         <NewGroup
           onClose={() => setNewGroup(false)}
@@ -446,10 +554,14 @@ function useDelete(file: FileRow, folder: string | undefined, onDeleted: () => v
 function ListRow({
   file,
   folder,
+  checked,
+  onToggle,
   onDeleted,
 }: {
   file: FileRow;
   folder: string | undefined;
+  checked: boolean;
+  onToggle: () => void;
   onDeleted: () => void;
 }) {
   const Icon = iconFor(file.mime_type, file.name);
@@ -457,6 +569,13 @@ function ListRow({
 
   return (
     <div className="group flex items-center gap-3 border-b border-border-soft px-4 py-2.5 transition-colors last:border-0 hover:bg-surface">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onToggle}
+        aria-label={`Select ${file.name}`}
+        className="h-3.5 w-3.5 shrink-0 accent-[var(--color-accent)]"
+      />
       <Icon className="h-4 w-4 shrink-0 text-ink-faint" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-ink" title={file.name}>

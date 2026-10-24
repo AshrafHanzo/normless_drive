@@ -55,6 +55,8 @@ struct Share {
     password_hash: Option<String>,
     allow_offline: bool,
     label: Option<String>,
+    /// When set, the link exposes only these messages.
+    message_ids: Option<Vec<i32>>,
 }
 
 /// Loads a share by token, enforcing revocation, expiry and usage cap.
@@ -67,7 +69,8 @@ async fn load(pool: &Db, token: &str) -> ApiResult<Share> {
     let row = client
         .query_opt(
             "SELECT id, user_id, folder_id, permissions, password_hash,
-                    expires_at, usage_limit, usage_count, allow_offline, label
+                    expires_at, usage_limit, usage_count, allow_offline, label,
+                    message_ids
                FROM shares
               WHERE token = $1 AND NOT revoked",
             &[&token],
@@ -94,6 +97,7 @@ async fn load(pool: &Db, token: &str) -> ApiResult<Share> {
         password_hash: row.get("password_hash"),
         allow_offline: row.get("allow_offline"),
         label: row.get("label"),
+        message_ids: row.get("message_ids"),
     })
 }
 
@@ -313,6 +317,14 @@ async fn list(
     while let Some(message) = messages.next().await.map_err(|error| {
         ApiError::Internal(anyhow::anyhow!("could not read the folder: {error}"))
     })? {
+        // A link restricted to specific files must not list the rest of
+        // the folder, however the owner reorganises it later.
+        if let Some(allowed) = share.message_ids.as_deref() {
+            if !allowed.contains(&message.id()) {
+                continue;
+            }
+        }
+
         let Some(Media::Document(document)) = message.media() else {
             continue;
         };
@@ -351,6 +363,15 @@ async fn download(
     }
     if !unlocked(&request, &share, &token) {
         return Err(ApiError::Forbidden("This link needs a password.".into()));
+    }
+
+    // Checked before anything is fetched. Filtering the listing alone
+    // would leave the download endpoint able to serve any file in the
+    // folder to anyone who guessed its message id.
+    if let Some(allowed) = share.message_ids.as_deref() {
+        if !allowed.contains(&message_id) {
+            return Err(ApiError::NotFound("No such file.".into()));
+        }
     }
 
     let connection = owner_connection(&pool, &keys, &clients, &config, &share).await?;

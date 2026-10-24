@@ -39,6 +39,7 @@ export interface Share {
   usage_limit: number | null;
   usage_count: number;
   allow_offline: boolean;
+  file_count: number;
   created_at: string;
 }
 
@@ -199,6 +200,7 @@ export const api = {
       label?: string;
       folder_id?: string;
       permissions: SharePermissions;
+      message_ids?: number[];
       password?: string;
       expiry_hours?: number;
       usage_limit?: number;
