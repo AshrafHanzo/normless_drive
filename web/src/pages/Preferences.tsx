@@ -3,6 +3,7 @@ import { Check, Monitor, Moon, RotateCcw, Sun, X } from "lucide-react";
 import { api, ApiError } from "../api";
 import { applyTheme, loadTheme, type Theme } from "../theme";
 import { applyPreset, loadPreset, PRESETS } from "../themes";
+import { loadZipPreference, saveZipPreference } from "../folderUpload";
 import { Alert, Button, Card, PasswordField } from "../ui";
 
 /// Settings that belong to the person, not to a file.
@@ -18,6 +19,7 @@ export function Preferences({
 }) {
   const [theme, setTheme] = useState<Theme>(loadTheme);
   const [preset, setPreset] = useState<string | null>(loadPreset);
+  const [zipFolders, setZipFolders] = useState(loadZipPreference);
   const [offline, setOffline] = useState<boolean | null>(null);
   const [offlineAvailable, setOfflineAvailable] = useState(false);
   const [password, setPassword] = useState("");
@@ -194,6 +196,31 @@ export function Preferences({
                 Back to the standard theme
               </Button>
             )}
+          </section>
+
+          <section className="mb-5 border-t border-border-soft pt-4">
+            <h3 className="mb-2 text-xs font-medium text-ink-muted">Uploads</h3>
+            <label className="flex cursor-pointer items-start justify-between gap-3 rounded-[var(--radius-control)] border border-border p-3">
+              <span>
+                <span className="block text-sm text-ink">
+                  Zip folders before upload
+                </span>
+                <span className="mt-1 block text-xs leading-relaxed text-ink-faint">
+                  {zipFolders
+                    ? "A folder becomes one .zip. Structure is kept exactly, but you must download the whole archive to get one file out of it."
+                    : "Every file is uploaded separately, each one downloadable on its own, with its path kept in the name."}
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={zipFolders}
+                onChange={(event) => {
+                  setZipFolders(event.target.checked);
+                  saveZipPreference(event.target.checked);
+                }}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+              />
+            </label>
           </section>
 
           <section className="mb-5 border-t border-border-soft pt-4">

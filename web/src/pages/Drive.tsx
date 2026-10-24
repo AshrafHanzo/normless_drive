@@ -6,6 +6,7 @@ import {
   FileText,
   FileVideo,
   File as FileIcon,
+  FolderUp,
   Globe,
   Inbox,
   LayoutGrid,
@@ -34,6 +35,16 @@ import { NewFolder } from "./NewFolder";
 import { NewGroup } from "./NewGroup";
 import { Sidebar } from "./Sidebar";
 import { UploadQueue, type QueueItem } from "./UploadQueue";
+import {
+  folderNameOf,
+  loadZipPreference,
+  relativePathOf,
+  // Aliased: Drive already has a 	otalBytes memo for the folder's own
+  // size, and the collision silently shadowed this function.
+  totalBytes as sumFileSizes,
+  zipFolder,
+  ZIP_LIMIT_BYTES,
+} from "../folderUpload";
 import { ShareDialog } from "./ShareDialog";
 
 type View = "list" | "grid";
@@ -71,6 +82,7 @@ export function Drive({
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [groups, setGroups] = useState<Group[]>([]);
   const picker = useRef<HTMLInputElement>(null);
+  const folderPicker = useRef<HTMLInputElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async (which?: string) => {
@@ -183,6 +195,68 @@ export function Drive({
     }
     setSelected(new Set());
     await load(folder);
+  }
+
+  /// Uploads a picked directory, either as one archive or file by file.
+  async function sendFolder(files: File[]) {
+    if (files.length === 0) return;
+
+    const name = folderNameOf(files);
+    const bytes = sumFileSizes(files);
+
+    if (loadZipPreference()) {
+      if (bytes > ZIP_LIMIT_BYTES) {
+        setError(
+          `That folder is ${(bytes / 1_000_000_000).toFixed(1)} GB. Zipping happens in your browser's memory, which will not hold that — turn off "Zip folders before upload" in Preferences to send the files individually instead.`,
+        );
+        return;
+      }
+
+      setUploading(true);
+      setError(null);
+      // Zipping a large folder takes a while with nothing else to show
+      // for it, so the queue gets an entry immediately rather than the
+      // page looking frozen.
+      setQueue([
+        {
+          id: "zip",
+          name: `${name}.zip`,
+          size: bytes,
+          state: "uploading",
+        },
+      ]);
+
+      try {
+        const archive = await zipFolder(files);
+        setQueue([
+          { id: "zip", name: archive.name, size: archive.size, state: "uploading" },
+        ]);
+        await api.files.upload(archive, folder);
+        setQueue([
+          { id: "zip", name: archive.name, size: archive.size, state: "done" },
+        ]);
+      } catch (caught) {
+        const message =
+          caught instanceof ApiError ? caught.message : "Could not zip that folder.";
+        setQueue([
+          { id: "zip", name: `${name}.zip`, size: bytes, state: "failed", error: message },
+        ]);
+      } finally {
+        setUploading(false);
+        if (folderPicker.current) folderPicker.current.value = "";
+        await load(folder);
+      }
+      return;
+    }
+
+    // Individual mode: the path inside the folder becomes the file name,
+    // the same convention the desktop app's backup uses, so a nested tree
+    // survives in a flat Telegram channel and is rebuildable from the
+    // names alone.
+    const renamed = files.map(
+      (file) => new File([file], relativePathOf(file), { type: file.type }),
+    );
+    await send(renamed);
   }
 
   async function syncFolders() {
@@ -303,6 +377,15 @@ export function Drive({
             )}
             <IconButton icon={LogOut} label="Sign out" onClick={onSignOut} />
 
+            <Button
+              variant="ghost"
+              busy={uploading}
+              onClick={() => folderPicker.current?.click()}
+              title="Upload a whole folder"
+            >
+              <FolderUp className="h-3.5 w-3.5" />
+              Folder
+            </Button>
             <Button busy={uploading} onClick={() => picker.current?.click()}>
               <Upload className="h-3.5 w-3.5" />
               Upload
@@ -319,7 +402,36 @@ export function Drive({
                 if (chosen.length) void send(chosen);
               }}
             />
-          </div>
+            <input
+
+              ref={folderPicker}
+
+              type="file"
+
+              // Non-standard but universally supported, and the only way a
+
+              // browser will offer a directory picker at all.
+
+              // @ts-expect-error -- not in React's typings
+
+              webkitdirectory=""
+
+              directory=""
+
+              multiple
+
+              hidden
+
+              onChange={(e) => {
+
+                const chosen = Array.from(e.target.files ?? []);
+
+                if (chosen.length) void sendFolder(chosen);
+
+              }}
+
+            />
+</div>
         </header>
 
         <main className="relative flex-1 overflow-y-auto p-4">
