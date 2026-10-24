@@ -310,6 +310,9 @@ export function Drive({
             <input
               ref={picker}
               type="file"
+              // Without this the browser's picker allows exactly one file,
+              // whatever the change handler is prepared to accept.
+              multiple
               hidden
               onChange={(e) => {
                 const chosen = Array.from(e.target.files ?? []);
