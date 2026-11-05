@@ -24,9 +24,12 @@ export interface Picked {
   files: PickedFile[];
 }
 
-/// Enough to notice a mistaken pick of a home directory before the browser
-/// spends ten minutes enumerating it.
-const MAX_FILES = 20000;
+/// A backstop against picking a whole drive by mistake, not a budget.
+///
+/// Reading this many handles takes a while and the progress counter says
+/// so, which is the point: a real folder gets through, and a mistaken pick
+/// of C:\ is noticed before the browser spends an hour on it.
+const MAX_FILES = 250_000;
 
 // Declared here rather than taken from lib.dom: TypeScript ships only part
 // of this API, and the async iteration used below is the part it omits.
@@ -55,7 +58,7 @@ export function supportsDirectoryHandle(): boolean {
 export class TooManyFiles extends Error {
   constructor() {
     super(
-      `That folder holds more than ${MAX_FILES.toLocaleString()} files. Pick a smaller one, or upload it in parts.`,
+      `That folder holds more than ${MAX_FILES.toLocaleString()} files — more than this was meant to take in one go. If that is really the folder you want, upload its subfolders one at a time.`,
     );
   }
 }
