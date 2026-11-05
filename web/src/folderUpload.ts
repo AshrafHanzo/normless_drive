@@ -15,9 +15,13 @@
 //
 // Zipping used to stop at 1.5 GB because the whole archive was assembled
 // in the tab's memory. It is now written through to a scratch file on
-// disk, so the only real ceiling is Telegram's: 2 GB in one message. A
-// folder past that is split across several archives, each one complete and
-// openable on its own, rather than refused.
+// disk, in zip64 where the size calls for it, so a folder of any size
+// becomes one archive — the server splits the upload across Telegram
+// messages and serves it back as one file, which means six zips to pick
+// between would be a complication with nothing behind it.
+//
+// Only a browser with no scratch file to write to still splits, because
+// there the archive really is held in memory and the ceiling is real.
 
 import type { Picked, PickedFile } from "./folderPick";
 import { openScratch, reserve, supportsScratch } from "./scratch";
@@ -46,14 +50,9 @@ export function saveZipPreference(value: boolean) {
     }
 }
 
-/// Telegram refuses a single file above 2 GB. The margin below it covers
-/// the archive's own headers — about a hundred bytes per entry — and
-/// leaves room for a file that grew between being picked and being read.
-export const PART_LIMIT_BYTES = 1_900_000_000;
-
 /// The ceiling when there is no scratch file to write to and the archive
-/// has to be assembled in memory after all. Lower than Telegram's, because
-/// the browser, not Telegram, is what gives out first.
+/// has to be assembled in memory after all. The browser, not Telegram, is
+/// what gives out first here.
 export const MEMORY_PART_LIMIT_BYTES = 500_000_000;
 
 /// A zip's central directory counts entries in sixteen bits.
@@ -78,17 +77,38 @@ export interface ZipPlan {
     /// Whether the archives are built on disk or in memory, which is what
     /// sets the ceiling they were packed against.
     streamed: boolean;
-    limit: number;
+    /// The largest one archive may be, or null when there is no such
+    /// limit — which is the ordinary case.
+    limit: number | null;
 }
 
 /// Decides how many archives the folder needs and what goes in each.
 ///
-/// Packed in the order the files were found rather than by size: an
-/// archive whose contents are a contiguous slice of the folder is one
-/// someone can reason about, and a few per cent of wasted space is a fair
-/// price for that.
+/// One, normally. Splitting only happens where the archive has to be held
+/// in memory, and then it is packed in the order the files were found
+/// rather than by size: an archive whose contents are a contiguous slice
+/// of the folder is one someone can reason about, and a few per cent of
+/// wasted space is a fair price for that.
 export function planZip(picked: Picked, streamed = supportsScratch()): ZipPlan {
-    const limit = streamed ? PART_LIMIT_BYTES : MEMORY_PART_LIMIT_BYTES;
+    if (streamed) {
+        return {
+            parts:
+                picked.files.length === 0
+                    ? []
+                    : [
+                          {
+                              name: `${picked.name}.zip`,
+                              entries: picked.files,
+                              bytes: totalBytes(picked.files),
+                          },
+                      ],
+            oversized: [],
+            streamed,
+            limit: null,
+        };
+    }
+
+    const limit = MEMORY_PART_LIMIT_BYTES;
     const oversized: PickedFile[] = [];
     const bins: PickedFile[][] = [];
 

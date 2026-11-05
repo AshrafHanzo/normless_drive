@@ -51,18 +51,15 @@ export function FolderReview({
 
   const zipDetail = useMemo(() => {
     const spare =
-      plan.oversized.length === 0
+      plan.oversized.length === 0 || plan.limit === null
         ? ""
         : ` ${plan.oversized.length} file${
             plan.oversized.length === 1 ? " is" : "s are"
           } bigger than one archive can hold and will go up on their own, whole.`;
     if (plan.parts.length <= 1) {
-      return `Structure kept exactly. You can still open the archive here and pull one file out of it without downloading the rest.${spare}`;
+      return `One archive, whatever its size — the structure kept exactly. You can open it here afterwards and pull a single file out without downloading the rest.${spare}`;
     }
-    const why = plan.streamed
-      ? "Telegram takes 2 GB in one message"
-      : "this browser has to build archives in memory";
-    return `Split into ${plan.parts.length} archives, because ${why}. Each one is complete and opens here on its own.${spare}`;
+    return `Split into ${plan.parts.length} archives, because this browser has to build them in memory. Each one is complete and opens here on its own.${spare}`;
   }, [plan]);
 
   const items = useMemo(
@@ -119,7 +116,7 @@ export function FolderReview({
               detail={zipDetail}
               selected={mode === "zip"}
               disabled={tooBigToZip}
-              disabledReason={`Every file here is over ${formatSize(plan.limit)}, which is more than one archive can hold.`}
+              disabledReason={`Every file here is over ${formatSize(plan.limit ?? 0)}, which is more than one archive can hold in this browser.`}
               onSelect={() => choose("zip")}
             />
             <ModeCard
