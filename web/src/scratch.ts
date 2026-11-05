@@ -14,11 +14,23 @@ import type { Sink } from "./zipStream";
 
 const ROOT = "nd-scratch";
 
-/// How long an abandoned run is left alone before it is swept.
+/// How often a running build says it is still alive.
+const HEARTBEAT_EVERY = 10_000;
+
+/// How quiet a run has to go before it is treated as abandoned.
 ///
-/// Long enough that a tab still working on one is never robbed of it —
-/// another tab cannot tell the difference between in progress and dead.
+/// A live build touches its marker every ten seconds, so a minute of
+/// silence means the tab holding it is gone. Without the marker there
+/// would be no way to tell a build in progress from a dead one, and the
+/// only safe rule would be to wait a day — which is a day of someone's
+/// disk held by an archive nobody is waiting for.
+const SILENT_FOR = 60_000;
+
+/// The fallback for runs left by a version that wrote no marker.
 const ABANDONED_AFTER = 24 * 60 * 60 * 1000;
+
+/// The file a live build keeps touching.
+const ALIVE = ".alive";
 
 // Declared here rather than taken from lib.dom, which ships only part of
 // this API — the same reason folderPick.ts declares its own.
@@ -151,6 +163,22 @@ export async function openScratch(name: string, expected = 0): Promise<Scratch> 
     let gone = false;
     let written = 0;
 
+    // Touched while the build runs, so a tab that opens later can tell
+    // this run from one whose tab was closed and clear that one out.
+    const beat = async () => {
+        try {
+            const marker = await run.getFileHandle(ALIVE, { create: true });
+            const writer = await marker.createWritable();
+            await writer.write(new Uint8Array(1));
+            await writer.close();
+        } catch {
+            // A missed beat only risks an early sweep of this run, and
+            // the sweep waits six beats before acting.
+        }
+    };
+    await beat();
+    const pulse = setInterval(() => void beat(), HEARTBEAT_EVERY);
+
     return {
         sink: {
             write: async (bytes) => {
@@ -173,6 +201,7 @@ export async function openScratch(name: string, expected = 0): Promise<Scratch> 
         async discard() {
             if (gone) return;
             gone = true;
+            clearInterval(pulse);
             if (open) {
                 open = false;
                 await writable.abort().catch(() => undefined);
@@ -184,8 +213,13 @@ export async function openScratch(name: string, expected = 0): Promise<Scratch> 
 
 /// Clears runs left behind by a tab that was closed mid-upload.
 ///
-/// Called once at startup and allowed to fail quietly: a stale scratch file
-/// is wasted disk, not a fault worth interrupting anyone over.
+/// Closing the tab stops the build where it stood — the archive lives in
+/// that page's JavaScript and nothing survives it — so a 10 GB part-built
+/// archive would otherwise sit on the disk. This reclaims it on the next
+/// visit, within a minute of the build having gone quiet.
+///
+/// Called at startup and allowed to fail quietly: a stale scratch file is
+/// wasted disk, not a fault worth interrupting anyone over.
 export async function sweep(): Promise<void> {
     const store = storage();
     if (!store?.getDirectory) return;
@@ -193,16 +227,34 @@ export async function sweep(): Promise<void> {
     try {
         const root = await store.getDirectory();
         const base = await root.getDirectoryHandle(ROOT, { create: false });
-        const cutoff = Date.now() - ABANDONED_AFTER;
+        const now = Date.now();
+
         for await (const key of base.keys()) {
-            const made = Number.parseInt(key.split("-")[0], 36);
-            if (Number.isFinite(made) && made < cutoff) {
+            if (await isAbandoned(base, key, now)) {
                 await base.removeEntry(key, { recursive: true }).catch(() => undefined);
             }
         }
     } catch {
         // No scratch directory yet, or no permission to look. Either way
         // there is nothing to clean.
+    }
+}
+
+async function isAbandoned(
+    base: DirectoryHandle,
+    key: string,
+    now: number,
+): Promise<boolean> {
+    try {
+        const run = await base.getDirectoryHandle(key, { create: false });
+        const marker = await run.getFileHandle(ALIVE, { create: false });
+        return now - (await marker.getFile()).lastModified > SILENT_FOR;
+    } catch {
+        // No marker: either a run from before they existed, or one whose
+        // tab died before the first beat. Fall back to the time encoded
+        // in the key, and give that benefit of the doubt.
+        const made = Number.parseInt(key.split("-")[0], 36);
+        return Number.isFinite(made) && now - made > ABANDONED_AFTER;
     }
 }
 

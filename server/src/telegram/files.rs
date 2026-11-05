@@ -343,7 +343,7 @@ async fn upload(
 /// storage until they are cleared — rather than a manifest pointing at
 /// messages that are not there.
 async fn send_in_parts<R>(
-    connection: &Connection,
+    connection: &std::sync::Arc<Connection>,
     peer: &grammers_client::types::Peer,
     reader: R,
     name: &str,
@@ -360,7 +360,11 @@ where
         inner: reader,
         hasher: <sha2::Sha256 as sha2::Digest>::new(),
     };
-    let mut part_ids = Vec::with_capacity(total);
+    let mut orphans = Orphans {
+        connection: std::sync::Arc::clone(connection),
+        peer: peer.clone(),
+        ids: Vec::with_capacity(total),
+    };
 
     for (index, (_, len)) in ranges.iter().enumerate() {
         let mut slice = (&mut digest).take(*len);
@@ -388,7 +392,7 @@ where
                     total
                 ))
             })?;
-        part_ids.push(message.id());
+        orphans.ids.push(message.id());
     }
 
     let manifest = super::split::Manifest {
@@ -396,11 +400,11 @@ where
         name: name.to_string(),
         size,
         part_count: total as u32,
-        part_ids,
+        part_ids: orphans.ids.clone(),
         sha256: Some(hex::encode(sha2::Digest::finalize(digest.hasher))),
     };
 
-    connection
+    let written = connection
         .client
         .send_message(
             peer,
@@ -412,8 +416,56 @@ where
                 "all {total} parts were uploaded, but the index describing them could not be \
                  sent: {error}"
             ))
-        })
-        .map_err(ApiError::from)
+        })?;
+
+    // The index exists, so the parts are no longer orphans.
+    orphans.keep();
+    Ok(written)
+}
+
+/// Removes the parts of a split upload that never got an index.
+///
+/// A browser that goes away mid-upload takes the request with it, and
+/// actix drops the handler exactly where it stood — no error is returned,
+/// no code after the await runs. `Drop` is the one thing that still
+/// happens, so the cleanup lives here. Without it, stopping a 10 GB
+/// upload halfway would leave several 2 GB messages in the account:
+/// invisible in the drive, since nothing indexes them, and charged for
+/// all the same.
+struct Orphans {
+    connection: std::sync::Arc<Connection>,
+    peer: grammers_client::types::Peer,
+    ids: Vec<i32>,
+}
+
+impl Orphans {
+    /// Called once the index naming these parts has been sent.
+    fn keep(mut self) {
+        self.ids.clear();
+    }
+}
+
+impl Drop for Orphans {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let connection = std::sync::Arc::clone(&self.connection);
+        let peer = self.peer.clone();
+        let ids = std::mem::take(&mut self.ids);
+
+        // Spawned, because a destructor cannot wait. The connection is
+        // behind an `Arc` that this task holds, so it stays open long
+        // enough to finish even though the request is already gone.
+        tokio::spawn(async move {
+            tracing::warn!(parts = ids.len(), "removing parts of an interrupted upload");
+            for batch in ids.chunks(FORWARD_BATCH) {
+                if let Err(error) = connection.client.delete_messages(&peer, batch).await {
+                    tracing::warn!(?error, "could not remove the parts of an interrupted upload");
+                }
+            }
+        });
+    }
 }
 
 /// A reader that digests everything passing through it.
