@@ -301,7 +301,7 @@ export const api = {
         ? `/api/files/${id}/download?folder=${folder}`
         : `/api/files/${id}/download`,
 
-    upload: async (file: File, folder?: string) => {
+    upload: async (file: File, folder?: string, signal?: AbortSignal) => {
       const form = new FormData();
       form.append("file", file);
       // No Content-Type header: the browser must set it so the multipart
@@ -313,10 +313,14 @@ export const api = {
       const params = new URLSearchParams({ size: String(file.size) });
       if (folder) params.set("folder", folder);
 
+      // An abort here rejects with a DOMException named AbortError rather
+      // than an ApiError, which is how the queue tells "stopped" apart
+      // from "went wrong".
       const response = await fetch(`/api/files?${params}`, {
         method: "POST",
         credentials: "same-origin",
         body: form,
+        signal,
       });
       if (!response.ok) {
         const body = await response.json().catch(() => null);

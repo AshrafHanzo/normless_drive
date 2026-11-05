@@ -121,6 +121,12 @@ function dosStamp(at: Date): { time: number; date: number } {
     };
 }
 
+/// The shape every browser API uses to say "you stopped this", so callers
+/// can tell a cancel apart from a failure with one check.
+function cancelled(): DOMException {
+    return new DOMException("The upload was cancelled.", "AbortError");
+}
+
 /// Zip paths use forward slashes and never start at a root.
 function normalize(path: string): string {
     return path.replace(/\\/g, "/").replace(/^\/+/, "");
@@ -308,6 +314,7 @@ export async function writeZip(
     entries: ZipEntry[],
     sink: Sink,
     onProgress?: (bytesRead: number) => void,
+    signal?: AbortSignal,
 ): Promise<number> {
     const encoder = new TextEncoder();
     const central: Uint8Array[] = [];
@@ -346,6 +353,12 @@ export async function writeZip(
 
         if (method === STORED) {
             for (;;) {
+                // Checked per chunk rather than per file: a single 600 MB
+                // clip should not have to finish before a cancel lands.
+                if (signal?.aborted) {
+                    await reader.cancel().catch(() => undefined);
+                    throw cancelled();
+                }
                 const { done, value } = await reader.read();
                 if (done) break;
                 crc = crcUpdate(crc, value);
@@ -367,6 +380,10 @@ export async function writeZip(
             };
 
             for (;;) {
+                if (signal?.aborted) {
+                    await reader.cancel().catch(() => undefined);
+                    throw cancelled();
+                }
                 const { done, value } = await reader.read();
                 if (done) break;
                 crc = crcUpdate(crc, value);

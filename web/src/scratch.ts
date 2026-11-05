@@ -43,6 +43,7 @@ interface DirectoryHandle {
 interface Storage {
     getDirectory?: () => Promise<DirectoryHandle>;
     estimate?: () => Promise<{ quota?: number; usage?: number }>;
+    persist?: () => Promise<boolean>;
 }
 
 function storage(): Storage | null {
@@ -56,34 +57,67 @@ export function supportsScratch(): boolean {
     return storage() !== null;
 }
 
+/// Thrown when the browser actually refuses a write, never in advance.
+///
+/// `navigator.storage.estimate()` is a guess, and asking it first was a
+/// mistake: it reported a few gigabytes on a machine with 169 GB free and
+/// refused a job that would have worked. So the archive is simply
+/// attempted, and this says how far it got and what the browser claims to
+/// allow — numbers worth having, rather than a flat refusal.
 export class NoRoom extends Error {
-    constructor(needed: number, available: number) {
+    constructor(wrote: number, needed: number, limit: Allowance | null) {
+        const claimed = limit
+            ? ` This browser allows the site ${gb(limit.quota)} in total and reports ${gb(limit.usage)} already in use.`
+            : "";
         super(
-            `There is not enough room to build the archive — it needs about ${gb(needed)} and the browser will only allow ${gb(available)}. Uploading the files separately needs none.`,
+            `The browser ran out of room building the archive — it wrote ${gb(wrote)} of about ${gb(needed)}.${claimed} Uploading as separate files instead needs no room at all.`,
         );
         this.name = "NoRoom";
     }
 }
 
 function gb(bytes: number): string {
-    return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+    return bytes >= 1_000_000_000
+        ? `${(bytes / 1_000_000_000).toFixed(1)} GB`
+        : `${Math.round(bytes / 1_000_000)} MB`;
 }
 
-/// Checks the browser will let us write this much before anything starts.
-///
-/// A quota it declines to report is treated as "go ahead": refusing on a
-/// missing number would block a browser that is perfectly able.
-export async function reserve(bytes: number): Promise<void> {
+interface Allowance {
+    quota: number;
+    usage: number;
+}
+
+async function allowance(): Promise<Allowance | null> {
     const store = storage();
-    if (!store?.estimate) return;
+    if (!store?.estimate) return null;
+    try {
+        const { quota, usage } = await store.estimate();
+        return quota ? { quota, usage: usage ?? 0 } : null;
+    } catch {
+        return null;
+    }
+}
 
-    const { quota, usage } = await store.estimate();
-    if (!quota) return;
+/// A browser is only out of room when it says so, in this one way.
+function isQuotaFailure(error: unknown): boolean {
+    return (
+        error instanceof DOMException &&
+        (error.name === "QuotaExceededError" || error.code === 22)
+    );
+}
 
-    // A tenth over, so a tight fit does not fail at the last entry.
-    const needed = bytes * 1.1;
-    const free = quota - (usage ?? 0);
-    if (free < needed) throw new NoRoom(needed, free);
+/// Asks the browser to treat this site's storage as worth keeping.
+///
+/// Chrome grants it silently to a site someone uses, and a granted origin
+/// gets a larger allowance and is not evicted under pressure. A refusal
+/// changes nothing we would do differently, so the answer is ignored.
+export async function requestPersistence(): Promise<void> {
+    try {
+        await storage()?.persist?.();
+    } catch {
+        // Not supported, or refused. Either way the archive is still
+        // worth attempting.
+    }
 }
 
 export interface Scratch {
@@ -99,7 +133,7 @@ export interface Scratch {
 /// The name is the handle's own, so `getFile()` returns a `File` already
 /// called the right thing — wrapping it in a renamed `File` would copy the
 /// whole archive a second time.
-export async function openScratch(name: string): Promise<Scratch> {
+export async function openScratch(name: string, expected = 0): Promise<Scratch> {
     const store = storage();
     if (!store?.getDirectory) {
         throw new Error("This browser cannot build an archive on disk.");
@@ -115,10 +149,19 @@ export async function openScratch(name: string): Promise<Scratch> {
 
     let open = true;
     let gone = false;
+    let written = 0;
 
     return {
         sink: {
-            write: (bytes) => writable.write(bytes),
+            write: async (bytes) => {
+                try {
+                    await writable.write(bytes);
+                    written += bytes.length;
+                } catch (caught) {
+                    if (!isQuotaFailure(caught)) throw caught;
+                    throw new NoRoom(written, expected, await allowance());
+                }
+            },
         },
         async finish() {
             if (open) {

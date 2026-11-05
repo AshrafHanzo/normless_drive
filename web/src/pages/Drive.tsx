@@ -106,6 +106,10 @@ export function Drive({
   const chain = useRef<Promise<void>>(Promise.resolve());
   const pending = useRef(0);
   const nextId = useRef(0);
+  // Cancellation. `live` aborts whatever is in flight right now; `stopped`
+  // is what the jobs still queued behind it check before starting.
+  const live = useRef<AbortController | null>(null);
+  const stopped = useRef(false);
   // Read by a job that finishes long after it started, when the folder
   // on screen may no longer be the one it was uploading into.
   const current = useRef(folder);
@@ -181,6 +185,10 @@ export function Drive({
     (rows: QueueItem[], work: () => Promise<void>) => {
       if (rows.length === 0) return;
       setError(null);
+      // Adding work while nothing is running clearly means "go", so an
+      // earlier stop is forgotten here rather than silently cancelling
+      // the new batch too.
+      if (pending.current === 0) stopped.current = false;
       setQueue((existing) => [...existing, ...rows]);
       pending.current += 1;
       setUploading(true);
@@ -218,20 +226,44 @@ export function Drive({
 
     enqueue(rows, async () => {
       for (const [index, file] of files.entries()) {
+        if (stopped.current) break;
         const id = rows[index].id;
         mark(id, "uploading");
+        live.current = new AbortController();
         try {
-          await api.files.upload(file, target);
+          await api.files.upload(file, target, live.current.signal);
           mark(id, "done");
         } catch (caught) {
+          if (wasStopped(caught)) {
+            mark(id, "cancelled");
+            break;
+          }
           mark(
             id,
             "failed",
             caught instanceof ApiError ? caught.message : "Upload failed.",
           );
+        } finally {
+          live.current = null;
         }
       }
     });
+  }
+
+  /// Stops the transfer and drops everything still queued behind it.
+  ///
+  /// Half-built archives are deleted by the job's own cleanup, so
+  /// stopping a 10 GB zip leaves nothing behind on the disk.
+  function stopUploads() {
+    stopped.current = true;
+    live.current?.abort();
+    setQueue((rows) =>
+      rows.map((row) =>
+        row.state === "waiting" || row.state === "uploading"
+          ? { ...row, state: "cancelled" as const, error: undefined }
+          : row,
+      ),
+    );
   }
 
   /// Pulls in folders that exist in Telegram but not here — the ones made
@@ -311,30 +343,41 @@ export function Drive({
 
     enqueue(rows, async () => {
       for (const [index, part] of plan.parts.entries()) {
+        if (stopped.current) break;
         const id = rows[index].id;
         mark(id, "uploading");
+        live.current = new AbortController();
         let built = null as Awaited<ReturnType<typeof buildArchive>> | null;
         try {
           // Each archive is built, sent and thrown away before the next
           // one starts, so a four-part upload never needs room for more
           // than one part at a time.
           let shown = -1;
-          built = await buildArchive(part, streamed, (read, total) => {
-            // Throttled to whole per cent: a render per chunk would be
-            // thousands of them saying nothing new.
-            const percent = total > 0 ? Math.floor((read / total) * 100) : 0;
-            if (percent === shown) return;
-            shown = percent;
-            setProgress(
-              plan.parts.length > 1
-                ? `Packing ${part.name} — ${percent}% (${index + 1} of ${plan.parts.length})`
-                : `Packing ${part.name} — ${percent}%`,
-            );
-          });
+          built = await buildArchive(
+            part,
+            streamed,
+            (read, total) => {
+              // Throttled to whole per cent: a render per chunk would be
+              // thousands of them saying nothing new.
+              const percent = total > 0 ? Math.floor((read / total) * 100) : 0;
+              if (percent === shown) return;
+              shown = percent;
+              setProgress(
+                plan.parts.length > 1
+                  ? `Packing ${part.name} — ${percent}% (${index + 1} of ${plan.parts.length})`
+                  : `Packing ${part.name} — ${percent}% · nothing has been sent yet`,
+              );
+            },
+            live.current.signal,
+          );
           setProgress(null);
-          await api.files.upload(built.file, target);
+          await api.files.upload(built.file, target, live.current.signal);
           mark(id, "done");
         } catch (caught) {
+          if (wasStopped(caught)) {
+            mark(id, "cancelled");
+            break;
+          }
           mark(
             id,
             "failed",
@@ -342,9 +385,10 @@ export function Drive({
           );
         } finally {
           setProgress(null);
-          // The scratch file goes whether the upload worked or not —
-          // leaving a 1.9 GB archive behind on a failure would be worse
-          // than the failure.
+          live.current = null;
+          // The scratch file goes whether the upload worked, failed or
+          // was stopped — leaving a 10 GB archive behind would be worse
+          // than any of them.
           await built?.release();
         }
       }
@@ -682,7 +726,11 @@ export function Drive({
         />
       )}
       {prefs && <Preferences phoneHint={phoneHint} onClose={() => setPrefs(false)} />}
-      <UploadQueue items={queue} onDismiss={() => setQueue([])} />
+      <UploadQueue
+        items={queue}
+        onDismiss={() => setQueue([])}
+        onStop={stopUploads}
+      />
 
       {newGroup && (
         <NewGroup
@@ -934,6 +982,14 @@ function GridCard({
       </div>
     </div>
   );
+}
+
+/// Tells a deliberate stop apart from something going wrong.
+///
+/// Every browser API that can be aborted rejects the same way, so one
+/// check covers the zip builder, the file reader and the upload itself.
+function wasStopped(error: unknown) {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 /// Only zip: the viewer reads the zip format specifically, and offering to

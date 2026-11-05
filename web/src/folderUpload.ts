@@ -24,7 +24,7 @@
 // there the archive really is held in memory and the ceiling is real.
 
 import type { Picked, PickedFile } from "./folderPick";
-import { openScratch, reserve, supportsScratch } from "./scratch";
+import { openScratch, requestPersistence, supportsScratch } from "./scratch";
 import { estimateSize, writeZip, type Sink, type ZipEntry } from "./zipStream";
 
 const STORAGE_KEY = "nd_zip_folders";
@@ -157,6 +157,7 @@ export async function buildArchive(
     part: ZipPart,
     streamed: boolean,
     onProgress?: (bytesRead: number, bytesTotal: number) => void,
+    signal?: AbortSignal,
 ): Promise<BuiltArchive> {
     const entries: ZipEntry[] = part.entries.map((item) => ({
         path: item.path,
@@ -175,19 +176,24 @@ export async function buildArchive(
                 chunks.push(bytes.slice());
             },
         };
-        await writeZip(entries, sink, report);
+        await writeZip(entries, sink, report, signal);
         const file = new File(chunks as BlobPart[], part.name, {
             type: "application/zip",
         });
         return { file, release: async () => undefined };
     }
 
-    await reserve(estimateSize(entries));
-    const scratch = await openScratch(part.name);
+    // Asked for before the first write, since a granted origin gets a
+    // larger allowance — which is exactly what a 10 GB archive needs.
+    await requestPersistence();
+
+    const scratch = await openScratch(part.name, estimateSize(entries));
     try {
-        await writeZip(entries, scratch.sink, report);
+        await writeZip(entries, scratch.sink, report, signal);
         return { file: await scratch.finish(), release: () => scratch.discard() };
     } catch (caught) {
+        // Cancelled or failed, the half-written archive goes now rather
+        // than sitting on the disk until tomorrow's sweep.
         await scratch.discard();
         throw caught;
     }
