@@ -38,13 +38,13 @@ import { NewGroup } from "./NewGroup";
 import { Sidebar } from "./Sidebar";
 import { UploadQueue, type QueueItem } from "./UploadQueue";
 import {
+  buildArchive,
   flatten,
-  // Aliased: Drive already has a totalBytes memo for the folder's own
-  // size, and the collision silently shadowed this function.
-  totalBytes as sumFileSizes,
-  zipFolder,
+  named,
+  planZip,
   type UploadMode,
 } from "../folderUpload";
+import { supportsScratch, sweep } from "../scratch";
 import {
   fromInput,
   pickDirectory,
@@ -99,6 +99,18 @@ export function Drive({
   const folderPicker = useRef<HTMLInputElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
 
+  // The upload queue's machinery. `chain` is the single worker: every
+  // batch is appended to it, so two of them can never run at once.
+  // `pending` counts the jobs still on it, and `nextId` keeps queue rows
+  // unique across batches.
+  const chain = useRef<Promise<void>>(Promise.resolve());
+  const pending = useRef(0);
+  const nextId = useRef(0);
+  // Read by a job that finishes long after it started, when the folder
+  // on screen may no longer be the one it was uploading into.
+  const current = useRef(folder);
+  current.current = folder;
+
   const load = useCallback(async (which?: string) => {
     setError(null);
     setFiles(null);
@@ -123,6 +135,12 @@ export function Drive({
   useEffect(() => void load(folder), [load, folder]);
   useEffect(() => void loadFolders(), [loadFolders]);
 
+  // Archives are built in a private scratch directory. A tab closed
+  // mid-upload leaves one behind, so yesterday's are cleared on the way
+  // in — quietly, since a stale scratch file is wasted disk and not a
+  // fault anyone needs telling about.
+  useEffect(() => void sweep(), []);
+
   // Ctrl/Cmd+F focuses search, the same shortcut the desktop app shows.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -135,53 +153,85 @@ export function Drive({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  /// Uploads a batch, one at a time.
-  ///
-  /// Sequential on purpose: every byte of every file crosses this server
-  /// on its way to Telegram, so running them in parallel does not make
-  /// the total any faster — it just makes each one slower and the
-  /// progress harder to read.
-  async function send(files: File[]) {
-    if (files.length === 0) return;
+  /// Moves one queue row along. By id, never by index — rows from a
+  /// second batch sit after the first in the same list, and an index into
+  /// one batch means something quite different in the other.
+  const mark = useCallback(
+    (id: string, state: QueueItem["state"], error?: string) => {
+      setQueue((rows) =>
+        rows.map((row) => (row.id === id ? { ...row, state, error } : row)),
+      );
+    },
+    [],
+  );
 
-    setUploading(true);
-    setError(null);
-    setQueue(
-      files.map((file, index) => ({
-        id: `${index}-${file.name}-${file.size}`,
+  /// Adds a batch to the one upload queue.
+  ///
+  /// There is a single worker, and everything waits its turn on it.
+  /// Uploads used to run as a loop per batch, so starting a second batch
+  /// — dropping files while the first was still going — ran two loops at
+  /// once against the same Telegram connection, each writing over the
+  /// other's rows. The first batch looked like it had stopped. It is one
+  /// chain now, so a second batch simply queues behind the first.
+  ///
+  /// Sequential within a batch too: every byte crosses this server on its
+  /// way to Telegram, so running them in parallel makes nothing faster —
+  /// only each one slower and the progress harder to read.
+  const enqueue = useCallback(
+    (rows: QueueItem[], work: () => Promise<void>) => {
+      if (rows.length === 0) return;
+      setError(null);
+      setQueue((existing) => [...existing, ...rows]);
+      pending.current += 1;
+      setUploading(true);
+
+      chain.current = chain.current
+        .then(work)
+        .catch(() => undefined)
+        .then(async () => {
+          pending.current -= 1;
+          if (pending.current === 0) setUploading(false);
+          await load(current.current);
+        });
+    },
+    [load],
+  );
+
+  function rowsFor(files: { name: string; size: number }[]): QueueItem[] {
+    return files.map((file) => {
+      nextId.current += 1;
+      return {
+        id: `q${nextId.current}`,
         name: file.name,
         size: file.size,
         state: "waiting" as const,
-      })),
-    );
+      };
+    });
+  }
 
-    for (const [index, file] of files.entries()) {
-      setQueue((current) =>
-        current.map((item, i) =>
-          i === index ? { ...item, state: "uploading" } : item,
-        ),
-      );
-      try {
-        await api.files.upload(file, folder);
-        setQueue((current) =>
-          current.map((item, i) =>
-            i === index ? { ...item, state: "done" } : item,
-          ),
-        );
-      } catch (caught) {
-        const message =
-          caught instanceof ApiError ? caught.message : "Upload failed.";
-        setQueue((current) =>
-          current.map((item, i) =>
-            i === index ? { ...item, state: "failed", error: message } : item,
-          ),
-        );
+  function send(files: File[]) {
+    if (files.length === 0) return;
+    // Captured now: the queue may still be running when someone switches
+    // folders, and these files belong where they were dropped.
+    const target = folder;
+    const rows = rowsFor(files);
+
+    enqueue(rows, async () => {
+      for (const [index, file] of files.entries()) {
+        const id = rows[index].id;
+        mark(id, "uploading");
+        try {
+          await api.files.upload(file, target);
+          mark(id, "done");
+        } catch (caught) {
+          mark(
+            id,
+            "failed",
+            caught instanceof ApiError ? caught.message : "Upload failed.",
+          );
+        }
       }
-    }
-
-    setUploading(false);
-    if (picker.current) picker.current.value = "";
-    await load(folder);
+    });
   }
 
   /// Pulls in folders that exist in Telegram but not here — the ones made
@@ -242,53 +292,67 @@ export function Drive({
     }
   }
 
-  /// Uploads a reviewed directory, either as one archive or file by file.
-  async function sendFolder(chosen: Picked, mode: UploadMode) {
+  /// Uploads a reviewed directory, either as archives or file by file.
+  function sendFolder(chosen: Picked, mode: UploadMode) {
     setPicked(null);
     if (folderPicker.current) folderPicker.current.value = "";
 
     if (mode === "individual") {
-      await send(flatten(chosen));
+      send(flatten(chosen));
       return;
     }
 
-    const bytes = sumFileSizes(chosen.files);
-    setUploading(true);
-    setError(null);
-    // Zipping a large folder takes a while with nothing else to show for
-    // it, so the queue gets an entry immediately rather than the page
-    // looking frozen.
-    setQueue([
-      { id: "zip", name: `${chosen.name}.zip`, size: bytes, state: "uploading" },
-    ]);
+    const target = folder;
+    const streamed = supportsScratch();
+    const plan = planZip(chosen, streamed);
+    const rows = rowsFor(
+      plan.parts.map((part) => ({ name: part.name, size: part.bytes })),
+    );
 
-    try {
-      const archive = await zipFolder(chosen, (done, total) => {
-        // Throttled: a render per file would be thousands of them for no
-        // extra information.
-        if (done % 25 === 0 || done === total) {
-          setProgress(`Compressing… ${done.toLocaleString()} of ${total.toLocaleString()}`);
+    enqueue(rows, async () => {
+      for (const [index, part] of plan.parts.entries()) {
+        const id = rows[index].id;
+        mark(id, "uploading");
+        let built = null as Awaited<ReturnType<typeof buildArchive>> | null;
+        try {
+          // Each archive is built, sent and thrown away before the next
+          // one starts, so a four-part upload never needs room for more
+          // than one part at a time.
+          let shown = -1;
+          built = await buildArchive(part, streamed, (read, total) => {
+            // Throttled to whole per cent: a render per chunk would be
+            // thousands of them saying nothing new.
+            const percent = total > 0 ? Math.floor((read / total) * 100) : 0;
+            if (percent === shown) return;
+            shown = percent;
+            setProgress(
+              plan.parts.length > 1
+                ? `Packing ${part.name} — ${percent}% (${index + 1} of ${plan.parts.length})`
+                : `Packing ${part.name} — ${percent}%`,
+            );
+          });
+          setProgress(null);
+          await api.files.upload(built.file, target);
+          mark(id, "done");
+        } catch (caught) {
+          mark(
+            id,
+            "failed",
+            caught instanceof Error ? caught.message : "Could not build that archive.",
+          );
+        } finally {
+          setProgress(null);
+          // The scratch file goes whether the upload worked or not —
+          // leaving a 1.9 GB archive behind on a failure would be worse
+          // than the failure.
+          await built?.release();
         }
-      });
-      setProgress(null);
-      setQueue([
-        { id: "zip", name: archive.name, size: archive.size, state: "uploading" },
-      ]);
-      await api.files.upload(archive, folder);
-      setQueue([
-        { id: "zip", name: archive.name, size: archive.size, state: "done" },
-      ]);
-    } catch (caught) {
-      const message =
-        caught instanceof ApiError ? caught.message : "Could not zip that folder.";
-      setQueue([
-        { id: "zip", name: `${chosen.name}.zip`, size: bytes, state: "failed", error: message },
-      ]);
-    } finally {
-      setProgress(null);
-      setUploading(false);
-      await load(folder);
-    }
+      }
+    });
+
+    // Anything too large for an archive of its own still has to go
+    // somewhere, so it follows behind as an ordinary file.
+    if (plan.oversized.length > 0) send(plan.oversized.map(named));
   }
 
   async function syncFolders() {
@@ -342,7 +406,7 @@ export function Drive({
         e.preventDefault();
         setDragging(false);
         const dropped = Array.from(e.dataTransfer.files ?? []);
-        if (dropped.length) void send(dropped);
+        if (dropped.length) send(dropped);
       }}
     >
       {sidebarOpen && (
@@ -409,16 +473,19 @@ export function Drive({
             )}
             <IconButton icon={LogOut} label="Sign out" onClick={onSignOut} />
 
+            {/* Not disabled while an upload runs: the queue takes a new
+                batch and runs it after the current one, which is the
+                whole point of there being a queue. */}
             <Button
               variant="ghost"
-              busy={uploading || picking}
+              busy={picking}
               onClick={() => void openFolder()}
               title="Upload a whole folder"
             >
               <FolderUp className="h-3.5 w-3.5" />
               Folder
             </Button>
-            <Button busy={uploading} onClick={() => picker.current?.click()}>
+            <Button onClick={() => picker.current?.click()}>
               <Upload className="h-3.5 w-3.5" />
               Upload
             </Button>
@@ -431,7 +498,10 @@ export function Drive({
               hidden
               onChange={(e) => {
                 const chosen = Array.from(e.target.files ?? []);
-                if (chosen.length) void send(chosen);
+                // Cleared straight away, not after the upload: the same
+                // files picked twice in a row must still fire a change.
+                e.target.value = "";
+                if (chosen.length) send(chosen);
               }}
             />
             <input
@@ -600,7 +670,7 @@ export function Drive({
             setPicked(null);
             if (folderPicker.current) folderPicker.current.value = "";
           }}
-          onConfirm={(mode) => void sendFolder(picked, mode)}
+          onConfirm={(mode) => sendFolder(picked, mode)}
         />
       )}
       {viewing && (

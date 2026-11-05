@@ -12,9 +12,9 @@ import {
 import type { Picked } from "../folderPick";
 import {
   loadZipPreference,
+  planZip,
   saveZipPreference,
   totalBytes,
-  ZIP_LIMIT_BYTES,
   type UploadMode,
 } from "../folderUpload";
 import { childrenOf, formatSize, parentOf, trail } from "../paths";
@@ -38,11 +38,32 @@ export function FolderReview({
 }) {
   const [cwd, setCwd] = useState("");
   const bytes = useMemo(() => totalBytes(picked.files), [picked]);
-  const tooBigToZip = bytes > ZIP_LIMIT_BYTES;
+
+  // How many archives this folder needs, and how big each is allowed to
+  // be, is decided here rather than at upload time — it is the one thing
+  // about zipping that is worth knowing before agreeing to it.
+  const plan = useMemo(() => planZip(picked), [picked]);
+  const tooBigToZip = plan.parts.length === 0;
 
   const [mode, setMode] = useState<UploadMode>(
     tooBigToZip ? "individual" : loadZipPreference() ? "zip" : "individual",
   );
+
+  const zipDetail = useMemo(() => {
+    const spare =
+      plan.oversized.length === 0
+        ? ""
+        : ` ${plan.oversized.length} file${
+            plan.oversized.length === 1 ? " is" : "s are"
+          } over ${formatSize(plan.limit)} on its own and will go up unzipped.`;
+    if (plan.parts.length <= 1) {
+      return `Structure kept exactly. You can still open the archive here and pull one file out of it without downloading the rest.${spare}`;
+    }
+    const why = plan.streamed
+      ? "Telegram takes 2 GB in one message"
+      : "this browser has to build archives in memory";
+    return `Split into ${plan.parts.length} archives, because ${why}. Each one is complete and opens here on its own.${spare}`;
+  }, [plan]);
 
   const items = useMemo(
     () => picked.files.map((item) => ({ path: item.path, size: item.file.size })),
@@ -94,11 +115,11 @@ export function FolderReview({
           <section className="grid gap-2 px-5 py-4 sm:grid-cols-2">
             <ModeCard
               icon={FileArchive}
-              title="As one .zip"
-              detail="Structure kept exactly. You can still open the archive here and pull one file out of it without downloading the rest."
+              title={plan.parts.length > 1 ? `As ${plan.parts.length} .zip files` : "As one .zip"}
+              detail={zipDetail}
               selected={mode === "zip"}
               disabled={tooBigToZip}
-              disabledReason={`Too large to zip in the browser — the archive is built in memory, and ${formatSize(bytes)} will not fit.`}
+              disabledReason={`Every file here is over ${formatSize(plan.limit)}, which is more than one archive can hold.`}
               onSelect={() => choose("zip")}
             />
             <ModeCard
@@ -192,9 +213,11 @@ export function FolderReview({
             </Button>
             <Button busy={busy} onClick={() => onConfirm(mode)}>
               <Upload className="h-3.5 w-3.5" />
-              {mode === "zip"
-                ? `Upload as ${picked.name}.zip`
-                : `Upload ${picked.files.length.toLocaleString()} files`}
+              {mode !== "zip"
+                ? `Upload ${picked.files.length.toLocaleString()} files`
+                : plan.parts.length > 1
+                  ? `Upload ${plan.parts.length} archives`
+                  : `Upload as ${plan.parts[0].name}`}
             </Button>
           </footer>
         </Card>

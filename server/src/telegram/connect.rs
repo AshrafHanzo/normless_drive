@@ -30,6 +30,14 @@ struct Live {
     last_used: Instant,
 }
 
+/// True while a request still holds this connection.
+///
+/// The map's own `Arc` is the one that is always there, so any count above
+/// one means someone is mid-flight on it.
+fn busy(live: &Live) -> bool {
+    Arc::strong_count(&live.connection) > 1
+}
+
 #[derive(Default)]
 pub struct Clients {
     inner: Mutex<HashMap<Uuid, Live>>,
@@ -50,7 +58,13 @@ impl Clients {
         {
             let mut map = self.inner.lock().await;
             if let Some(live) = map.get_mut(&user) {
-                if live.last_used.elapsed() <= IDLE_TTL {
+                // `last_used` is stamped when a connection is handed out,
+                // not when the work on it finishes — and a 2 GB upload
+                // holds one for far longer than the TTL. So a connection
+                // another request is still using counts as fresh however
+                // long ago it was taken; otherwise a second request
+                // arriving mid-upload would open a whole new session.
+                if live.last_used.elapsed() <= IDLE_TTL || busy(live) {
                     live.last_used = Instant::now();
                     return Ok(Arc::clone(&live.connection));
                 }
@@ -128,7 +142,7 @@ impl Clients {
             let mut map = self.inner.lock().await;
             let stale: Vec<Uuid> = map
                 .iter()
-                .filter(|(_, live)| live.last_used.elapsed() > IDLE_TTL)
+                .filter(|(_, live)| live.last_used.elapsed() > IDLE_TTL && !busy(live))
                 .map(|(id, _)| *id)
                 .collect();
             stale
