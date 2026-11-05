@@ -6,6 +6,10 @@
 node_modules/
 /web/dist/
 /web/.vite/
+# tsc's incremental cache. It is rewritten by every build, including the
+# one the VPS runs, which left the deploy unable to fast-forward until the
+# file was thrown away by hand.
+/web/tsconfig.tsbuildinfo
 
 # Secrets and local config. The .env on the VPS holds the database password
 # and every user's data depends on it staying out of this repo.
