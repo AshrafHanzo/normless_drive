@@ -20,9 +20,10 @@ use crate::{
     permissions,
 };
 
-pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(web::resource("/api/files/remote").route(web::post().to(remote_upload)));
-}
+// No `configure` of its own. A bare `/api/files/remote` resource is never
+// reached: the `/api/files` scope matches the prefix first and answers 404
+// when nothing inside it matches, so this route has to live in that scope.
+// It is registered by `files::configure`.
 
 #[derive(Deserialize)]
 pub struct RemoteRequest {
@@ -34,7 +35,7 @@ pub struct RemoteRequest {
     pub name: Option<String>,
 }
 
-async fn remote_upload(
+pub async fn remote_upload(
     request: HttpRequest,
     user: CurrentUser,
     body: web::Json<RemoteRequest>,

@@ -283,6 +283,13 @@ export const api = {
         body: json({ url, folder, name }),
       }),
 
+    /// `from` and `to` are folder ids; undefined means Saved Messages.
+    move: (message_ids: number[], from?: string, to?: string) =>
+      request<{ ok: true; moved: number; failed: number }>("/api/files/move", {
+        method: "POST",
+        body: json({ message_ids, from, to }),
+      }),
+
     remove: (id: number, folder?: string) =>
       request<{ ok: true }>(
         folder ? `/api/files/${id}?folder=${folder}` : `/api/files/${id}`,

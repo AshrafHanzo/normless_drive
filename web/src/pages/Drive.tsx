@@ -6,6 +6,7 @@ import {
   FileText,
   FileVideo,
   File as FileIcon,
+  FolderInput,
   FolderOpen,
   FolderUp,
   Globe,
@@ -52,6 +53,7 @@ import {
 } from "../folderPick";
 import { formatSize } from "../paths";
 import { FolderReview } from "./FolderReview";
+import { MoveDialog } from "./MoveDialog";
 import { ShareDialog } from "./ShareDialog";
 import { ZipViewer } from "./ZipViewer";
 
@@ -80,6 +82,7 @@ export function Drive({
   const [uploading, setUploading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sharing, setSharing] = useState(false);
+  const [moving, setMoving] = useState(false);
   const [prefs, setPrefs] = useState(false);
   const [remote, setRemote] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -480,6 +483,10 @@ export function Drive({
                   <Share2 className="h-3.5 w-3.5" />
                   Share these
                 </Button>
+                <Button variant="ghost" onClick={() => setMoving(true)}>
+                  <FolderInput className="h-3.5 w-3.5" />
+                  Move to…
+                </Button>
                 <Button variant="ghost" onClick={() => void deleteSelected()}>
                   <Trash2 className="h-3.5 w-3.5" />
                   Delete
@@ -564,6 +571,24 @@ export function Drive({
           onFolderCreated={(id) => {
             void loadFolders();
             setFolder(id);
+          }}
+        />
+      )}
+      {moving && (
+        <MoveDialog
+          ids={[...selected]}
+          currentFolder={folder}
+          folders={folders}
+          onClose={() => setMoving(false)}
+          onMoved={(summary) => {
+            setMoving(false);
+            setSelected(new Set());
+            setProgress(summary);
+            window.setTimeout(() => setProgress(null), 5000);
+            // Folders too: the destination may have been created inside
+            // the dialog, and the sidebar's sizes have changed either way.
+            void loadFolders();
+            void load(folder);
           }}
         />
       )}

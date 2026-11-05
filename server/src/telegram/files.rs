@@ -30,6 +30,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::scope("/api/files")
             .route("", web::get().to(list))
             .route("", web::post().to(upload))
+            // Both of these must be declared before `/{id}`, and inside
+            // this scope rather than beside it — a sibling resource under
+            // the same prefix never gets a chance to match.
+            .route("/remote", web::post().to(super::remote::remote_upload))
+            .route("/move", web::post().to(move_files))
             .route("/{id}/download", web::get().to(download))
             .route("/{id}", web::delete().to(remove)),
     );
@@ -292,6 +297,133 @@ async fn upload(
         "ok": true,
         "name": name,
         "size": size
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct MoveRequest {
+    pub message_ids: Vec<i32>,
+    /// Where they are now. Absent means Saved Messages.
+    #[serde(default)]
+    pub from: Option<Uuid>,
+    /// Where they should end up. Absent means Saved Messages.
+    #[serde(default)]
+    pub to: Option<Uuid>,
+}
+
+/// Telegram's own ceiling for one `messages.forwardMessages` call.
+const FORWARD_BATCH: usize = 100;
+
+/// Moves files between folders.
+///
+/// Telegram has no move: a message belongs to the chat it was sent to. So
+/// this forwards to the destination and deletes the original — and the
+/// forward happens entirely on Telegram's servers, meaning a 2 GB file
+/// moves in a moment and no bytes cross this server or the browser.
+///
+/// Two consequences worth knowing, both inherent rather than chosen: the
+/// copy is a new message, so its id and its date are new; and it carries
+/// Telegram's "forwarded from" marker when viewed in the Telegram app.
+///
+/// The original is deleted only for files that actually arrived. A partial
+/// failure therefore leaves duplicates, never a hole.
+async fn move_files(
+    request: HttpRequest,
+    user: CurrentUser,
+    body: web::Json<MoveRequest>,
+    keys: web::Data<KeyCache>,
+    clients: web::Data<SharedClients>,
+    pool: web::Data<Db>,
+) -> ApiResult<HttpResponse> {
+    // A move is both halves at once: something appears in one folder and
+    // vanishes from another. Someone allowed only one of those should not
+    // get the pair by combining them.
+    permissions::require(&pool, user.id, permissions::Capability::Upload).await?;
+    permissions::require(&pool, user.id, permissions::Capability::Delete).await?;
+
+    let MoveRequest { message_ids, from, to } = body.into_inner();
+
+    if message_ids.is_empty() {
+        return Err(ApiError::BadRequest("Nothing was selected.".into()));
+    }
+    if from == to {
+        return Err(ApiError::BadRequest(
+            "Those files are already in that folder.".into(),
+        ));
+    }
+
+    let connection = connection_for(&request, &user, &keys, &clients, &pool).await?;
+    // Resolved before anything moves: a wrong destination should fail while
+    // the files are still untouched.
+    let source = super::folders::resolve(&connection.client, &pool, user.id, from).await?;
+    let destination = super::folders::resolve(&connection.client, &pool, user.id, to).await?;
+
+    let mut moved = 0usize;
+    let mut failed = 0usize;
+
+    for batch in message_ids.chunks(FORWARD_BATCH) {
+        let forwarded = connection
+            .client
+            .forward_messages(&destination, batch, &source)
+            .await
+            .map_err(|error| TelegramError::Other(format!("could not move the files: {error}")))?;
+
+        // Paired by position: Telegram answers in the order it was asked,
+        // with a gap where a message could not be forwarded.
+        let mut landed = Vec::new();
+        for (old_id, result) in batch.iter().zip(forwarded.into_iter()) {
+            match result {
+                Some(message) => landed.push((*old_id, message.id())),
+                None => failed += 1,
+            }
+        }
+
+        if landed.is_empty() {
+            continue;
+        }
+
+        let originals: Vec<i32> = landed.iter().map(|(old, _)| *old).collect();
+        connection
+            .client
+            .delete_messages(&source, &originals)
+            .await
+            .map_err(|error| {
+                // The copies exist by now, so this leaves duplicates rather
+                // than losing anything — say which half failed.
+                TelegramError::Other(format!(
+                    "the files were copied but the originals could not be removed: {error}"
+                ))
+            })?;
+
+        moved += landed.len();
+
+        // Keep the quota tally pointing at the file's new home. Best effort:
+        // the move has already happened, and a file the tally has lost track
+        // of is a smaller problem than an error for a move that worked.
+        if let Ok(db) = pool.get().await {
+            for (old_id, new_id) in &landed {
+                let updated = db
+                    .execute(
+                        "UPDATE uploads SET folder_id = $1, message_id = $2
+                          WHERE user_id = $3
+                            AND message_id = $4
+                            AND folder_id IS NOT DISTINCT FROM $5",
+                        &[&to, new_id, &user.id, old_id, &from],
+                    )
+                    .await;
+                if let Err(error) = updated {
+                    tracing::warn!(?error, "moved a file but could not re-point its quota row");
+                }
+            }
+        }
+    }
+
+    tracing::info!(user = %user.id, moved, failed, ?from, ?to, "moved files");
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "ok": true,
+        "moved": moved,
+        "failed": failed,
     })))
 }
 
