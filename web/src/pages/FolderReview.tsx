@@ -55,7 +55,7 @@ export function FolderReview({
         ? ""
         : ` ${plan.oversized.length} file${
             plan.oversized.length === 1 ? " is" : "s are"
-          } over ${formatSize(plan.limit)} on its own and will go up unzipped.`;
+          } bigger than one archive can hold and will go up on their own, whole.`;
     if (plan.parts.length <= 1) {
       return `Structure kept exactly. You can still open the archive here and pull one file out of it without downloading the rest.${spare}`;
     }

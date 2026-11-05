@@ -390,17 +390,38 @@ async fn download(
         .next()
         .ok_or_else(|| ApiError::NotFound("No such file.".into()))?;
 
-    let Some(Media::Document(document)) = message.media() else {
-        return Err(ApiError::NotFound("That message has no file.".into()));
+    // Either one document, or the index of a file stored as several — a
+    // share link serves both the same way, as one continuous file.
+    let (sources, name, mime, size) = match message.media() {
+        Some(Media::Document(document)) => {
+            let raw = document.name();
+            let name = if raw.trim().is_empty() { "download" } else { raw }.to_string();
+            let mime = document
+                .mime_type()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let size = document.size();
+            (
+                crate::telegram::ranged::Source::single(Media::Document(document), size),
+                name,
+                mime,
+                size,
+            )
+        }
+        _ => {
+            let manifest = crate::telegram::split::parse_manifest(message.text())
+                .ok_or_else(|| ApiError::NotFound("That message has no file.".into()))?;
+            let sources =
+                crate::telegram::split::resolve_parts(&connection.client, &peer, &manifest).await?;
+            (
+                sources,
+                manifest.name,
+                "application/octet-stream".to_string(),
+                manifest.size as i64,
+            )
+        }
     };
 
-    let raw = document.name();
-    let name = if raw.trim().is_empty() { "download" } else { raw };
-    let mime = document
-        .mime_type()
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let size = document.size();
     let disposition = format!(
         "attachment; filename=\"{}\"",
         name.chars()
@@ -418,7 +439,7 @@ async fn download(
     Ok(crate::telegram::ranged::serve(
         &request,
         connection.client.clone(),
-        Media::Document(document),
+        sources,
         size,
         mime,
         disposition,

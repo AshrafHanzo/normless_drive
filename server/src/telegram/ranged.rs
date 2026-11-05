@@ -11,6 +11,13 @@
 //! of which 512 KiB chunks at 512 KiB offsets satisfy by construction. An
 //! arbitrary start lands inside a chunk, so the leading bytes of the first
 //! one are dropped and the trailing bytes of the last are truncated.
+//!
+//! A file may be more than one document. Anything over Telegram's 2 GB
+//! ceiling is stored as several of them (see `split`), and this serves the
+//! sequence as one continuous file: a range starting in the middle of part
+//! three begins its reads there. Each part is a separate Telegram file with
+//! its own offsets starting at zero, so the chunk arithmetic is done per
+//! part rather than once over the whole.
 
 use actix_web::http::{header, StatusCode};
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -115,42 +122,104 @@ fn splice(mut chunk: Vec<u8>, drop_prefix: &mut usize, remaining: &mut u64) -> O
     Some(chunk)
 }
 
+/// One Telegram document, and how many of the logical file's bytes it holds.
+///
+/// An ordinary file is a single source. A split file is several, in order.
+pub struct Source {
+    pub media: Media,
+    pub len: u64,
+}
+
+impl Source {
+    pub fn single(media: Media, size: i64) -> Vec<Self> {
+        vec![Source {
+            media,
+            len: size.max(0) as u64,
+        }]
+    }
+}
+
+/// Which source a byte of the logical file lives in, and how far into it.
+///
+/// Returns one past the last source for an offset beyond the end, rather
+/// than panicking: a caller that is off by one gets an empty read instead
+/// of a crash.
+///
+/// Takes lengths rather than sources so it can be tested without a live
+/// Telegram document to build a `Media` from.
+fn locate(lengths: &[u64], at: u64) -> (usize, u64) {
+    let mut consumed = 0u64;
+    for (index, len) in lengths.iter().enumerate() {
+        if at < consumed + len {
+            return (index, at - consumed);
+        }
+        consumed += len;
+    }
+    (lengths.len(), 0)
+}
+
 /// Streams `length` bytes starting at `start`, pulling from Telegram.
 fn body(
     client: Client,
-    media: Media,
+    sources: Vec<Source>,
     start: u64,
     length: u64,
     message_id: i32,
 ) -> impl Stream<Item = Result<web::Bytes, actix_web::Error>> {
-    let skip = (start / CHUNK).min(i32::MAX as u64) as i32;
-    let mut drop_prefix = (start % CHUNK) as usize;
-    let mut remaining = length;
+    let lengths: Vec<u64> = sources.iter().map(|source| source.len).collect();
 
     async_stream::stream! {
-        // Order matters: `skip_chunks` multiplies by the chunk size that is
-        // set at the time it is called.
-        let mut chunks = client
-            .iter_download(&media)
-            .chunk_size(CHUNK as i32)
-            .skip_chunks(skip);
+        let (mut index, mut offset) = locate(&lengths, start);
+        let mut remaining = length;
 
-        while remaining > 0 {
-            match chunks.next().await {
-                Ok(Some(chunk)) => {
-                    if let Some(wanted) = splice(chunk, &mut drop_prefix, &mut remaining) {
-                        yield Ok::<_, actix_web::Error>(web::Bytes::from(wanted));
+        while remaining > 0 && index < sources.len() {
+            let source = &sources[index];
+            let skip = (offset / CHUNK).min(i32::MAX as u64) as i32;
+            let mut drop_prefix = (offset % CHUNK) as usize;
+            // How much of what is still wanted lies inside this part.
+            let mut wanted_here = (source.len - offset).min(remaining);
+
+            // Order matters: `skip_chunks` multiplies by the chunk size that
+            // is set at the time it is called.
+            let mut chunks = client
+                .iter_download(&source.media)
+                .chunk_size(CHUNK as i32)
+                .skip_chunks(skip);
+
+            while wanted_here > 0 {
+                match chunks.next().await {
+                    Ok(Some(chunk)) => {
+                        if let Some(piece) = splice(chunk, &mut drop_prefix, &mut wanted_here) {
+                            remaining -= piece.len() as u64;
+                            yield Ok::<_, actix_web::Error>(web::Bytes::from(piece));
+                        }
+                    }
+                    // The part ran out before it had given what it was
+                    // recorded as holding. Moving to the next one would
+                    // splice its bytes into the gap and hand back a file
+                    // that is wrong rather than short, so stop here.
+                    Ok(None) => {
+                        tracing::warn!(
+                            message_id,
+                            part = index,
+                            short_by = wanted_here,
+                            "a file part ended early"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        // The headers are long gone by now, so this cannot
+                        // become a clean HTTP error — the transfer just ends
+                        // short. Log it so a truncated download is
+                        // explainable.
+                        tracing::warn!(?error, message_id, "download stream failed mid-transfer");
+                        return;
                     }
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    // The headers are long gone by now, so this cannot become
-                    // a clean HTTP error — the transfer just ends short. Log
-                    // it so a truncated download is explainable.
-                    tracing::warn!(?error, message_id, "download stream failed mid-transfer");
-                    break;
-                }
             }
+
+            index += 1;
+            offset = 0;
         }
     }
 }
@@ -162,7 +231,7 @@ fn body(
 pub fn serve(
     request: &HttpRequest,
     client: Client,
-    media: Media,
+    sources: Vec<Source>,
     size: i64,
     mime: String,
     disposition: String,
@@ -187,7 +256,7 @@ pub fn serve(
             // Advertised on the full response too — that is how a client
             // learns it may ask for a range next time.
             .insert_header((header::ACCEPT_RANGES, "bytes"))
-            .streaming(Box::pin(body(client, media, 0, total, message_id))),
+            .streaming(Box::pin(body(client, sources, 0, total, message_id))),
 
         Requested::Part(span) => {
             let length = span.len();
@@ -200,14 +269,107 @@ pub fn serve(
                 ))
                 .insert_header((header::CONTENT_LENGTH, length.to_string()))
                 .insert_header((header::ACCEPT_RANGES, "bytes"))
-                .streaming(Box::pin(body(client, media, span.start, length, message_id)))
+                .streaming(Box::pin(body(client, sources, span.start, length, message_id)))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, splice, Requested, Span, CHUNK};
+    use super::{locate, parse, splice, Requested, Span, CHUNK};
+
+    #[test]
+    fn an_offset_resolves_to_the_part_that_holds_it() {
+        let parts = [100u64, 100, 50];
+
+        assert_eq!(locate(&parts, 0), (0, 0));
+        assert_eq!(locate(&parts, 99), (0, 99));
+        // The first byte of the second part. An off-by-one here would
+        // re-send a whole part or skip one.
+        assert_eq!(locate(&parts, 100), (1, 0));
+        assert_eq!(locate(&parts, 150), (1, 50));
+        assert_eq!(locate(&parts, 200), (2, 0));
+        assert_eq!(locate(&parts, 249), (2, 49));
+        // Past the end: one past the last part, never a panic.
+        assert_eq!(locate(&parts, 250), (3, 0));
+        assert_eq!(locate(&parts, 9999), (3, 0));
+    }
+
+    #[test]
+    fn a_single_part_behaves_as_it_always_did() {
+        assert_eq!(locate(&[1000], 0), (0, 0));
+        assert_eq!(locate(&[1000], 999), (0, 999));
+    }
+
+    /// Replays what `body` does across several parts: each part restarts
+    /// its own chunking at zero, and the pieces must join into exactly the
+    /// requested window of the logical file.
+    #[test]
+    fn a_range_spanning_parts_is_rebuilt_exactly() {
+        let chunk = 8usize;
+        // A file of 250 bytes stored as three parts.
+        let file: Vec<u8> = (0..250u32).map(|n| (n % 251) as u8).collect();
+        let bounds = [(0usize, 100usize), (100, 100), (200, 50)];
+
+        let served = |start: u64, length: u64| -> Vec<u8> {
+            let sizes: Vec<u64> = bounds.iter().map(|(_, len)| *len as u64).collect();
+            // Inlined `locate`, over plain lengths.
+            let (mut index, mut offset) = {
+                let mut consumed = 0u64;
+                let mut found = (sizes.len(), 0);
+                for (i, len) in sizes.iter().enumerate() {
+                    if start < consumed + len {
+                        found = (i, start - consumed);
+                        break;
+                    }
+                    consumed += len;
+                }
+                found
+            };
+
+            let mut remaining = length;
+            let mut out = Vec::new();
+
+            while remaining > 0 && index < bounds.len() {
+                let (base, len) = bounds[index];
+                let mut drop_prefix = (offset % chunk as u64) as usize;
+                let mut wanted_here = (len as u64 - offset).min(remaining);
+
+                let mut at = (offset / chunk as u64) as usize * chunk;
+                while wanted_here > 0 && at < len {
+                    let end = (at + chunk).min(len);
+                    let chunk_bytes = file[base + at..base + end].to_vec();
+                    if let Some(piece) = splice(chunk_bytes, &mut drop_prefix, &mut wanted_here) {
+                        remaining -= piece.len() as u64;
+                        out.extend_from_slice(&piece);
+                    }
+                    at = end;
+                }
+                index += 1;
+                offset = 0;
+            }
+            out
+        };
+
+        // The whole file, reassembled.
+        assert_eq!(served(0, 250), file);
+        // Entirely inside the first part.
+        assert_eq!(served(5, 20), file[5..25]);
+        // Across the first boundary, starting mid-chunk.
+        assert_eq!(served(95, 20), file[95..115]);
+        // Across both boundaries.
+        assert_eq!(served(90, 130), file[90..220]);
+        // Starting exactly on a boundary.
+        assert_eq!(served(100, 10), file[100..110]);
+        // Entirely inside the last part.
+        assert_eq!(served(210, 10), file[210..220]);
+        // The tail, which is how a zip's index is read — and the case that
+        // matters for looking inside a split archive.
+        assert_eq!(served(240, 10), file[240..]);
+        // One byte, on each side of a boundary.
+        assert_eq!(served(99, 1), file[99..100]);
+        assert_eq!(served(100, 1), file[100..101]);
+    }
 
     fn part(start: u64, end: u64) -> Requested {
         Requested::Part(Span { start, end })

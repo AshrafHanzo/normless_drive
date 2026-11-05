@@ -21,6 +21,7 @@ pub mod qr;
 pub mod phone;
 pub mod ranged;
 pub mod routes;
+pub mod split;
 pub mod session_store;
 
 use std::collections::HashMap;

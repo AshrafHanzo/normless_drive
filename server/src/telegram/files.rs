@@ -116,19 +116,39 @@ async fn list(
         .await
         .map_err(|error| TelegramError::Other(format!("could not read messages: {error}")))?
     {
-        // Only messages carrying a document are files; the rest are notes
-        // the user sent themselves and are not part of the drive.
-        let Some(Media::Document(document)) = message.media() else {
-            continue;
-        };
-
-        files.push(FileRow {
-            id: message.id(),
-            name: non_empty(document.name(), "untitled"),
-            size: document.size(),
-            mime_type: document.mime_type().map(str::to_string),
-            date: message.date().timestamp(),
-        });
+        match message.media() {
+            // A document is a file — unless it is one slice of a large one,
+            // in which case the manifest below stands for the whole thing
+            // and showing the slices too would be noise.
+            Some(Media::Document(document)) => {
+                if super::split::is_part(message.text()) {
+                    continue;
+                }
+                files.push(FileRow {
+                    id: message.id(),
+                    name: non_empty(document.name(), "untitled"),
+                    size: document.size(),
+                    mime_type: document.mime_type().map(str::to_string),
+                    date: message.date().timestamp(),
+                });
+            }
+            // A message with no document is a note the user sent
+            // themselves and not part of the drive — unless it is the
+            // manifest of a file too big for one message, which is the one
+            // row that should appear for it.
+            _ => {
+                let Some(manifest) = super::split::parse_manifest(message.text()) else {
+                    continue;
+                };
+                files.push(FileRow {
+                    id: message.id(),
+                    name: manifest.name,
+                    size: manifest.size as i64,
+                    mime_type: None,
+                    date: message.date().timestamp(),
+                });
+            }
+        }
 
         if files.len() >= limit {
             break;
@@ -165,16 +185,31 @@ async fn download(
         .next()
         .ok_or_else(|| ApiError::NotFound("No such file.".into()))?;
 
-    let Some(Media::Document(document)) = message.media() else {
-        return Err(ApiError::NotFound("That message has no file.".into()));
+    // Either one document, or the manifest of a file stored as several.
+    // Both become a list of sources that `serve` streams as one file.
+    let (sources, name, mime, size) = match message.media() {
+        Some(Media::Document(document)) => {
+            let name = non_empty(document.name(), "download");
+            let mime = document
+                .mime_type()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let size = document.size();
+            (super::ranged::Source::single(Media::Document(document), size), name, mime, size)
+        }
+        _ => {
+            let manifest = super::split::parse_manifest(message.text())
+                .ok_or_else(|| ApiError::NotFound("That message has no file.".into()))?;
+            let sources =
+                super::split::resolve_parts(&connection.client, &peer, &manifest).await?;
+            (
+                sources,
+                manifest.name,
+                "application/octet-stream".to_string(),
+                manifest.size as i64,
+            )
+        }
     };
-
-    let name = non_empty(document.name(), "download");
-    let mime = document
-        .mime_type()
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let size = document.size();
 
     // Streamed, not collected: a 2 GB file must not be assembled in memory
     // before the first byte reaches the browser. `serve` also answers a
@@ -183,7 +218,7 @@ async fn download(
     Ok(super::ranged::serve(
         &request,
         connection.client.clone(),
-        Media::Document(document),
+        sources,
         size,
         mime,
         format!("attachment; filename=\"{}\"", sanitize_name(&name)),
@@ -233,16 +268,6 @@ async fn upload(
     if size == 0 {
         return Err(ApiError::BadRequest("That file is empty.".into()));
     }
-    // Telegram refuses a single document above this, and the splitter that
-    // would work around it is not built yet — so say so plainly rather
-    // than let the upload run for an hour and then fail.
-    const TELEGRAM_MAX: u64 = 2_000_000_000;
-    if size > TELEGRAM_MAX {
-        return Err(ApiError::BadRequest(format!(
-            "Telegram accepts at most 2 GB in one file. This is {:.2} GB.",
-            size as f64 / 1_000_000_000.0
-        )));
-    }
 
     // Checked against the declared size before a byte is transferred. A
     // client that under-declares gets caught below when the stream runs
@@ -252,22 +277,27 @@ async fn upload(
     let body = field.map(|chunk| {
         chunk.map_err(|error| std::io::Error::other(format!("upload interrupted: {error}")))
     });
-    let mut reader = tokio_util::io::StreamReader::new(body);
+    let reader = tokio_util::io::StreamReader::new(body);
 
-    let uploaded = connection
-        .client
-        .upload_stream(&mut reader, size as usize, name.clone())
-        .await
-        .map_err(|error| TelegramError::Other(format!("upload to Telegram failed: {error}")))?;
+    let message = if super::split::should_split(size) {
+        send_in_parts(&connection, &peer, reader, &name, size).await?
+    } else {
+        let mut reader = reader;
+        let uploaded = connection
+            .client
+            .upload_stream(&mut reader, size as usize, name.clone())
+            .await
+            .map_err(|error| TelegramError::Other(format!("upload to Telegram failed: {error}")))?;
 
-    // `text`/`document` are builder methods on an existing InputMessage,
-    // not constructors — hence building from an empty caption rather than
-    // calling InputMessage::text directly.
-    let message = connection
-        .client
-        .send_message(&peer, InputMessage::from("").document(uploaded))
-        .await
-        .map_err(|error| TelegramError::Other(format!("could not attach the file: {error}")))?;
+        // `text`/`document` are builder methods on an existing InputMessage,
+        // not constructors — hence building from an empty caption rather than
+        // calling InputMessage::text directly.
+        connection
+            .client
+            .send_message(&peer, InputMessage::from("").document(uploaded))
+            .await
+            .map_err(|error| TelegramError::Other(format!("could not attach the file: {error}")))?
+    };
 
     // Recorded for the quota. A failure here must not fail an upload that
     // already succeeded — the file is in Telegram either way, and the
@@ -298,6 +328,118 @@ async fn upload(
         "name": name,
         "size": size
     })))
+}
+
+/// Uploads a file too big for one Telegram message, as several.
+///
+/// The body is read once, straight through: each part takes its slice off
+/// the same stream, so a 20 GB upload needs no disk and no more memory
+/// than a single one. A SHA-256 of the whole file falls out of that one
+/// pass and goes in the manifest, which is what makes a reassembled
+/// download checkable against what was sent.
+///
+/// The manifest goes last, once every part has landed. A failure part way
+/// through therefore leaves orphaned parts — invisible, and costing
+/// storage until they are cleared — rather than a manifest pointing at
+/// messages that are not there.
+async fn send_in_parts<R>(
+    connection: &Connection,
+    peer: &grammers_client::types::Peer,
+    reader: R,
+    name: &str,
+    size: u64,
+) -> ApiResult<grammers_client::types::Message>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let ranges = super::split::part_ranges(size);
+    let total = ranges.len();
+    let mut digest = Digesting {
+        inner: reader,
+        hasher: <sha2::Sha256 as sha2::Digest>::new(),
+    };
+    let mut part_ids = Vec::with_capacity(total);
+
+    for (index, (_, len)) in ranges.iter().enumerate() {
+        let mut slice = (&mut digest).take(*len);
+        let uploaded = connection
+            .client
+            .upload_stream(&mut slice, *len as usize, super::split::part_name(index))
+            .await
+            .map_err(|error| {
+                TelegramError::Other(format!(
+                    "upload failed on part {} of {}: {error}",
+                    index + 1,
+                    total
+                ))
+            })?;
+
+        let caption = super::split::part_caption(index, total, name);
+        let message = connection
+            .client
+            .send_message(peer, InputMessage::from(caption.as_str()).document(uploaded))
+            .await
+            .map_err(|error| {
+                TelegramError::Other(format!(
+                    "could not attach part {} of {}: {error}",
+                    index + 1,
+                    total
+                ))
+            })?;
+        part_ids.push(message.id());
+    }
+
+    let manifest = super::split::Manifest {
+        schema_version: 1,
+        name: name.to_string(),
+        size,
+        part_count: total as u32,
+        part_ids,
+        sha256: Some(hex::encode(sha2::Digest::finalize(digest.hasher))),
+    };
+
+    connection
+        .client
+        .send_message(
+            peer,
+            InputMessage::from(super::split::manifest_text(&manifest)?.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            TelegramError::Other(format!(
+                "all {total} parts were uploaded, but the index describing them could not be \
+                 sent: {error}"
+            ))
+        })
+        .map_err(ApiError::from)
+}
+
+/// A reader that digests everything passing through it.
+///
+/// The hash has to come from the same pass as the upload: the body is a
+/// network stream that cannot be rewound, so there is no second chance to
+/// read it.
+struct Digesting<R> {
+    inner: R,
+    hasher: sha2::Sha256,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Digesting<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let this = self.as_mut().get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            sha2::Digest::update(&mut this.hasher, &buf.filled()[before..]);
+        }
+        polled
+    }
 }
 
 #[derive(Deserialize)]
@@ -361,6 +503,39 @@ async fn move_files(
     let mut moved = 0usize;
     let mut failed = 0usize;
 
+    // A file stored in several messages cannot just be forwarded: the
+    // copies get new ids, so the index naming them would point back at the
+    // originals. Those are moved one at a time, re-indexed on arrival, and
+    // taken out of the ordinary batch below.
+    //
+    // Which ones they are is settled in one pass over the whole selection
+    // rather than a lookup per file, since a hundred round trips before
+    // anything moves is a hundred round trips.
+    let selected = super::split::fetch_by_id(&connection.client, &source, &message_ids).await?;
+    let mut plain = Vec::with_capacity(message_ids.len());
+
+    for (id, found) in message_ids.iter().zip(selected.into_iter()) {
+        let manifest = found.as_ref().filter(|m| m.media().is_none()).and_then(|m| {
+            super::split::parse_manifest(m.text())
+        });
+        let Some(manifest) = manifest else {
+            plain.push(*id);
+            continue;
+        };
+
+        match move_split(&connection, &source, &destination, &manifest, *id).await {
+            Ok(new_id) => {
+                moved += 1;
+                repoint(&pool, user.id, *id, new_id, from, to).await;
+            }
+            Err(error) => {
+                tracing::warn!(?error, message_id = id, "could not move a split file");
+                failed += 1;
+            }
+        }
+    }
+    let message_ids = plain;
+
     for batch in message_ids.chunks(FORWARD_BATCH) {
         let forwarded = connection
             .client
@@ -397,24 +572,8 @@ async fn move_files(
 
         moved += landed.len();
 
-        // Keep the quota tally pointing at the file's new home. Best effort:
-        // the move has already happened, and a file the tally has lost track
-        // of is a smaller problem than an error for a move that worked.
-        if let Ok(db) = pool.get().await {
-            for (old_id, new_id) in &landed {
-                let updated = db
-                    .execute(
-                        "UPDATE uploads SET folder_id = $1, message_id = $2
-                          WHERE user_id = $3
-                            AND message_id = $4
-                            AND folder_id IS NOT DISTINCT FROM $5",
-                        &[&to, new_id, &user.id, old_id, &from],
-                    )
-                    .await;
-                if let Err(error) = updated {
-                    tracing::warn!(?error, "moved a file but could not re-point its quota row");
-                }
-            }
+        for (old_id, new_id) in &landed {
+            repoint(&pool, user.id, *old_id, *new_id, from, to).await;
         }
     }
 
@@ -447,11 +606,24 @@ async fn remove(
     let connection = connection_for(&request, &user, &keys, &clients, &pool).await?;
     let peer = super::folders::resolve(&connection.client, &pool, user.id, query.folder).await?;
 
-    connection
-        .client
-        .delete_messages(&peer, &[message_id])
-        .await
-        .map_err(|error| TelegramError::Other(format!("could not delete: {error}")))?;
+    // A large file is a manifest plus its parts. Deleting only the
+    // manifest would leave the parts behind, invisible and still paying
+    // for themselves in storage, so they go first — the manifest last, so
+    // that a failure midway leaves something that still names what is
+    // missing rather than a set of orphans with nothing pointing at them.
+    let mut doomed = vec![message_id];
+    if let Some(manifest) = manifest_at(&connection, &peer, message_id).await {
+        doomed = manifest.part_ids;
+        doomed.push(message_id);
+    }
+
+    for batch in doomed.chunks(FORWARD_BATCH) {
+        connection
+            .client
+            .delete_messages(&peer, batch)
+            .await
+            .map_err(|error| TelegramError::Other(format!("could not delete: {error}")))?;
+    }
 
     // Keep the quota tally honest. Best effort: the file is already gone
     // from Telegram, so failing the request now would be misleading.
@@ -466,6 +638,130 @@ async fn remove(
 
     tracing::info!(user = %user.id, message_id, "deleted");
     Ok(HttpResponse::Ok().json(serde_json::json!({ "ok": true })))
+}
+
+/// Points a file's quota row at where it has just been moved to.
+///
+/// Best effort: the move has already happened, and a file the tally has
+/// lost track of is a smaller problem than an error for a move that
+/// worked.
+async fn repoint(
+    pool: &Db,
+    user: Uuid,
+    old_id: i32,
+    new_id: i32,
+    from: Option<Uuid>,
+    to: Option<Uuid>,
+) {
+    let Ok(db) = pool.get().await else { return };
+    let updated = db
+        .execute(
+            "UPDATE uploads SET folder_id = $1, message_id = $2
+              WHERE user_id = $3
+                AND message_id = $4
+                AND folder_id IS NOT DISTINCT FROM $5",
+            &[&to, &new_id, &user, &old_id, &from],
+        )
+        .await;
+    if let Err(error) = updated {
+        tracing::warn!(?error, "moved a file but could not re-point its quota row");
+    }
+}
+
+/// Moves one file that is stored as several messages.
+///
+/// The parts are forwarded, a fresh index naming the copies is sent to the
+/// destination, and only then is the original removed. Ordered that way on
+/// purpose: every intermediate state is one where the file is readable
+/// somewhere. The worst outcome is a duplicate, never a file in pieces.
+async fn move_split(
+    connection: &Connection,
+    source: &grammers_client::types::Peer,
+    destination: &grammers_client::types::Peer,
+    manifest: &super::split::Manifest,
+    manifest_id: i32,
+) -> ApiResult<i32> {
+    let mut new_ids = Vec::with_capacity(manifest.part_ids.len());
+
+    for batch in manifest.part_ids.chunks(FORWARD_BATCH) {
+        let forwarded = connection
+            .client
+            .forward_messages(destination, batch, source)
+            .await
+            .map_err(|error| {
+                TelegramError::Other(format!("could not copy the file's parts: {error}"))
+            })?;
+
+        for result in forwarded {
+            let Some(message) = result else {
+                // A part that did not arrive means the copy is incomplete.
+                // Stop before writing an index for it: the parts that did
+                // arrive are orphans, which cost storage, while the
+                // original stays whole and readable.
+                return Err(ApiError::Conflict(format!(
+                    "\"{}\" could not be copied in full, so it has been left where it was.",
+                    manifest.name
+                )));
+            };
+            new_ids.push(message.id());
+        }
+    }
+
+    let moved = super::split::Manifest {
+        part_ids: new_ids,
+        ..manifest.clone()
+    };
+    let written = connection
+        .client
+        .send_message(
+            destination,
+            InputMessage::from(super::split::manifest_text(&moved)?.as_str()),
+        )
+        .await
+        .map_err(|error| {
+            TelegramError::Other(format!("could not write the copied file's index: {error}"))
+        })?;
+
+    // The copy is complete and readable from here on, so the original can
+    // go. Parts first, then the index, matching `remove`.
+    let mut doomed = manifest.part_ids.clone();
+    doomed.push(manifest_id);
+    for batch in doomed.chunks(FORWARD_BATCH) {
+        connection
+            .client
+            .delete_messages(source, batch)
+            .await
+            .map_err(|error| {
+                TelegramError::Other(format!(
+                    "\"{}\" was copied, but the original could not be removed: {error}",
+                    manifest.name
+                ))
+            })?;
+    }
+
+    Ok(written.id())
+}
+
+/// Reads a message, answering with its manifest if it turns out to be one.
+///
+/// Best effort on purpose: every caller already has a sensible thing to do
+/// when this says no, and a message that cannot be fetched is not a reason
+/// to fail an operation that would otherwise work on it directly.
+async fn manifest_at(
+    connection: &Connection,
+    peer: &grammers_client::types::Peer,
+    message_id: i32,
+) -> Option<super::split::Manifest> {
+    let messages = connection
+        .client
+        .get_messages_by_id(peer, &[message_id])
+        .await
+        .ok()?;
+    let message = messages.into_iter().flatten().next()?;
+    if message.media().is_some() {
+        return None;
+    }
+    super::split::parse_manifest(message.text())
 }
 
 /// `Document::name()` returns an empty string rather than `None` when a
